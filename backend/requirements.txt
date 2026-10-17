@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+sqlalchemy
+alembic
+pydantic
+pydantic-settings
+psycopg[binary]
+python-dotenv
+pytest
+httpx
+
+web3>=6.15.0

@@ -1,19 +1,63 @@
-import { products, demoTransactions, recentActivity } from "./mockData";
-import { calculateRisk } from "./riskEngine";
+/**
+ * Legacy mock API shim — Phase 1
+ *
+ * This file keeps all existing component imports working while the
+ * codebase migrates to the new service layer in src/lib/api/.
+ *
+ * @deprecated  Import from "@/lib/api" instead.
+ *
+ * Existing synchronous callers (getProduct, getProducts) are kept sync
+ * for backward compat; the route component will be updated in a future
+ * commit to use the async service layer directly.
+ */
+import { products, verificationHistory, blockchainTransactions } from "./mockData";
+import { assessRisk, calculateRisk } from "./riskEngine";
 
+// ─── Synchronous helpers (backward compat) ───────────────────────────────────
+
+/** @deprecated Use getProduct() from "@/lib/api" */
 export const getProducts = () => products;
-export const getProduct = (productId: string) => products.find((product) => product.id.toLowerCase() === productId.trim().toLowerCase());
+
+/** @deprecated Use getProduct() from "@/lib/api" */
+export const getProduct = (productId: string) =>
+  products.find((p) => p.id.toLowerCase() === productId.trim().toLowerCase());
+
+/** @deprecated Use verifyProduct() from "@/lib/api" */
 export const verifyProduct = (productId: string) => {
   const product = getProduct(productId);
-  return { product: product ?? null, riskScore: product ? calculateRisk(product) : 0, verifiedAt: "Just now" };
+  const riskScore = product ? calculateRisk(product) : 0;
+  return { product: product ?? null, riskScore, verifiedAt: "Just now" };
 };
-export const getVerificationHistory = (_productId?: string) => recentActivity;
+
+/** @deprecated Use getVerificationHistory() from "@/lib/api" */
+export const getVerificationHistory = (_productId?: string) =>
+  verificationHistory.map((e) => ({
+    productId: e.productId,
+    time: e.timeAgo,
+    place: e.place,
+  }));
+
+/** @deprecated Use getProductProvenance() from "@/lib/api" */
 export const getProvenance = (productId: string) => ({
   product: getProduct(productId),
   nodes: ["Manufacturer", "Distribution hub", "Retail partner", "Verified customer"],
 });
-export const getBlockchainTransactions = (_productId?: string) => demoTransactions;
+
+/** @deprecated Use getBlockchainTransactions() from "@/lib/api" */
+export const getBlockchainTransactions = (_productId?: string) =>
+  blockchainTransactions.map((tx) => ({
+    block: tx.blockNumber,
+    hash: tx.hash,
+    timestamp: tx.timeAgo,
+    event: tx.event,
+    productId: tx.productId,
+    status: tx.status,
+  }));
+
+/** @deprecated Use getProductRiskAssessment() from "@/lib/api" */
 export const getRiskAnalysis = (productId: string) => {
   const product = getProduct(productId);
-  return product ? { product, riskScore: calculateRisk(product) } : null;
+  return product
+    ? { product, riskScore: calculateRisk(product), assessment: assessRisk(product.riskFactors) }
+    : null;
 };
