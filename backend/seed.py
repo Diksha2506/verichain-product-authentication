@@ -33,7 +33,7 @@ def seed():
         _seed_verification_scans(db)
         _seed_risk_assessments(db)
         _seed_alerts(db)
-        print("✓ Seed complete.")
+        print("[OK] Seed complete.")
     finally:
         db.close()
 
@@ -70,7 +70,7 @@ def _seed_manufacturers(db):
     _get_or_create_manufacturer(db, "MFG-NIKE-US", "Nike Manufacturing", "US")
     _get_or_create_manufacturer(db, "MFG-APPLE-US", "Apple Inc.", "US")
     _get_or_create_manufacturer(db, "MFG-SONY-JP", "Sony Corporation", "JP")
-    print("  ✓ Manufacturers")
+    print("  [OK] Manufacturers")
 
 
 # ─── Products ────────────────────────────────────────────────────────────────
@@ -120,7 +120,7 @@ def _seed_products(db):
         metadata_hash="0000000000000000000000000000000000000000000000000000000000000000",
         manufactured_at=None,
     )
-    print("  ✓ Products")
+    print("  [OK] Products")
 
 
 # ─── Supply-chain events ──────────────────────────────────────────────────────
@@ -129,7 +129,7 @@ def _seed_supply_chain(db):
     nike = db.query(Product).filter_by(product_id="VC-NIKE-001").first()
     # Only seed if events don't exist
     if db.query(SupplyChainEvent).filter_by(product_id=nike.id).first():
-        print("  ✓ Supply chain (already seeded)")
+        print("  [OK] Supply chain (already seeded)")
         return
 
     events = [
@@ -156,7 +156,7 @@ def _seed_supply_chain(db):
     ]
     db.bulk_save_objects(events)
     db.commit()
-    print("  ✓ Supply chain events")
+    print("  [OK] Supply chain events")
 
 
 # ─── Verification scans ───────────────────────────────────────────────────────
@@ -204,16 +204,16 @@ def _seed_verification_scans(db):
     if not db.query(VerificationScan).first():
         db.bulk_save_objects([VerificationScan(**s) for s in scans_data])
         db.commit()
-        print("  ✓ Verification scans")
+        print("  [OK] Verification scans")
     else:
-        print("  ✓ Verification scans (already seeded)")
+        print("  [OK] Verification scans (already seeded)")
 
 
 # ─── Risk assessments ────────────────────────────────────────────────────────
 
 def _seed_risk_assessments(db):
     if db.query(RiskAssessment).first():
-        print("  ✓ Risk assessments (already seeded)")
+        print("  [OK] Risk assessments (already seeded)")
         return
 
     products = {p.product_id: p for p in db.query(Product).all()}
@@ -238,14 +238,14 @@ def _seed_risk_assessments(db):
     ]
     db.bulk_save_objects(assessments)
     db.commit()
-    print("  ✓ Risk assessments")
+    print("  [OK] Risk assessments")
 
 
 # ─── Alerts ──────────────────────────────────────────────────────────────────
 
 def _seed_alerts(db):
     if db.query(Alert).first():
-        print("  ✓ Alerts (already seeded)")
+        print("  [OK] Alerts (already seeded)")
         return
 
     products = {p.product_id: p for p in db.query(Product).all()}
@@ -270,7 +270,7 @@ def _seed_alerts(db):
     ]
     db.bulk_save_objects(alerts_data)
     db.commit()
-    print("  ✓ Alerts")
+    print("  [OK] Alerts")
 
 
 if __name__ == "__main__":

@@ -56,6 +56,20 @@ def test_live_blockchain_register_and_verify(client, db_session, local_hardhat_c
     db_session.commit()
     db_session.refresh(prod)
 
+    from app.models.supply_chain import SupplyChainEvent
+    sc_event = SupplyChainEvent(
+        product_id=prod.id,
+        event_type="MANUFACTURED",
+        actor_id=mfg.manufacturer_id,
+        location="Beaverton, OR, US",
+        latitude=45.5231,
+        longitude=-122.6765,
+        timestamp=datetime(2026, 9, 5, 8, 0, tzinfo=timezone.utc),
+        transaction_reference="0x123456"
+    )
+    db_session.add(sc_event)
+    db_session.commit()
+
     # 1. Register on chain through the backend endpoint
     reg_resp = client.post(f"/api/products/{unique_id}/blockchain/register")
     assert reg_resp.status_code == 200, f"Registration failed: {reg_resp.text}"

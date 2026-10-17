@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createFileRoute } from "@tanstack/react-router";
 import {
   Activity, AlertTriangle, ArrowDownRight, ArrowRight, ArrowUpRight, BadgeCheck, Blocks, Box,
@@ -9,9 +9,10 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { calculateRisk, describeRisk, riskFactorRows } from "@/lib/riskEngine";
-import { getProduct, getProducts, getVerificationHistory, verifyProduct, getBlockchainTransactions } from "@/lib/mockApi";
+import { getProduct, getProducts, getVerificationHistory, verifyProduct as verifyProductMock, getBlockchainTransactions } from "@/lib/mockApi";
+import { verifyProduct, API_CONFIG } from "@/lib/api";
 import type { Product } from "@/types/product";
-import type { VerificationState } from "@/types/verification";
+import type { BlockchainEvidence, ProvenanceEvidence, RiskEvidence, VerificationState } from "@/types/verification";
 
 // ─── Service-layer data (components must not import mockData directly) ────────
 const products = getProducts();
@@ -33,7 +34,15 @@ export const Route = createFileRoute("/")({
 });
 
 type Page = "overview" | "verify" | "registry" | "supply" | "risk" | "history" | "alerts" | "analytics" | "admin";
-type Result = { id: string; status: Product["status"] | "NOT FOUND"; score: number };
+type Result = {
+  id: string;
+  status: Product["status"] | "NOT FOUND" | "INDETERMINATE";
+  score: number;
+  decisionReason?: string;
+  blockchainEvidence?: BlockchainEvidence;
+  provenanceEvidence?: ProvenanceEvidence;
+  riskEvidence?: RiskEvidence;
+};
 
 const navGroups: { label: string; items: { page: Page; label: string; icon: typeof LayoutDashboard; count?: string }[] }[] = [
   { label: "Console", items: [
@@ -82,11 +91,31 @@ function VeriChainApp() {
 
   useEffect(() => {
     if (step < 0 || step >= 5) return;
-    const timer = window.setTimeout(() => {
+    const timer = window.setTimeout(async () => {
       const nextStep = step + 1;
       if (nextStep >= 5) {
-        const found = verifyProduct(productId);
-        setResult({ id: productId.toUpperCase().trim(), status: found.product?.status ?? "NOT FOUND", score: found.riskScore });
+        const apiResult = await verifyProduct({ productId });
+        if (apiResult.ok) {
+          const d = apiResult.data;
+          setResult({
+            id: d.productId,
+            status: (d.outcome === "NOT FOUND" ? "NOT FOUND" : d.outcome) as Result["status"],
+            score: d.riskAssessment.totalScore,
+            decisionReason: d.decisionReason,
+            blockchainEvidence: d.blockchainEvidence,
+            provenanceEvidence: d.provenanceEvidence,
+            riskEvidence: d.riskEvidence,
+          });
+        } else {
+          // If in mock mode, use the mock data. If in real API mode, display the explicit error notice without silently returning mock results.
+          if (API_CONFIG.USE_MOCK) {
+            const found = verifyProductMock(productId);
+            setResult({ id: productId.toUpperCase().trim(), status: found.product?.status ?? "NOT FOUND", score: found.riskScore });
+          } else {
+            setResult(null);
+            setNotice(`Backend verification failed: ${apiResult.error ?? "API unavailable"}`);
+          }
+        }
         setStep(5);
       } else setStep(nextStep);
     }, 650);
@@ -309,14 +338,212 @@ function VerifyScreen({ productId, setProductId, result, step, runVerification, 
           <div className="mt-4 space-y-2">{steps.map((label, index) => { const done = step > index || step === 5; const active = step === index; return <div key={label} className={`flex items-center gap-2.5 rounded border px-2.5 py-2 ${active ? "border-cyan/30 bg-cyan/5" : "border-line bg-background/60"}`}><div className={`grid size-5 shrink-0 place-items-center rounded-full border font-mono text-[8px] ${done ? "border-green/30 bg-green/10 text-green" : active ? "instrument-pulse border-cyan/40 bg-cyan/10 text-cyan" : "border-line text-muted-foreground"}`}>{done ? "✓" : String(index + 1).padStart(2, "0")}</div><span className={`flex-1 text-[10px] ${active ? "text-cyan" : done ? "text-foreground" : "text-muted-foreground"}`}>{label}{active ? "…" : ""}</span>{done && <span className="font-mono text-[8px] text-green">COMPLETE</span>}</div>; })}</div>
         </Panel>
         {checking && <div className="rounded-md border border-cyan/25 bg-cyan/5 px-4 py-3"><div className="flex items-center gap-2 font-mono text-[10px] text-cyan"><span className="instrument-pulse size-1.5 rounded-full bg-cyan" />VERIFYING {productId || "PRODUCT"}</div><div className="mt-2 h-1 overflow-hidden rounded bg-background"><div className="h-full rounded bg-cyan transition-all duration-300" style={{ width: `${(step + 1) * 20}%` }} /></div></div>}
-        {result && <div className={`rounded-md border p-4 ${status === "AUTHENTIC" ? "border-green/30 bg-green/5" : status === "SUSPICIOUS" ? "border-amber/35 bg-amber/5" : "border-red/35 bg-red/5"}`}>
-          <div className="flex flex-wrap items-start justify-between gap-3"><div className="flex items-start gap-2.5"><div className={`grid size-9 shrink-0 place-items-center rounded border ${status === "AUTHENTIC" ? "border-green/30 bg-green/10 text-green" : status === "SUSPICIOUS" ? "border-amber/30 bg-amber/10 text-amber" : "border-red/30 bg-red/10 text-red"}`}>{status === "AUTHENTIC" ? <ShieldCheck size={19} /> : status === "SUSPICIOUS" ? <AlertTriangle size={19} /> : <ShieldAlert size={19} />}</div><div><div className={`font-display text-[15px] font-semibold ${resultColor}`}>{status === "AUTHENTIC" ? "AUTHENTIC PRODUCT" : status === "SUSPICIOUS" ? "SUSPICIOUS PRODUCT" : status === "NOT FOUND" ? "PRODUCT NOT FOUND" : "CLONE SUSPECTED"}</div><div className="mt-1 text-[10px] text-muted-foreground">{product?.name ?? result.id} · {product?.manufacturer ?? "No verified manufacturer record"}</div></div></div><div className="text-right"><div className={`font-display text-[25px] font-semibold ${resultColor}`}>{result.score}<span className="text-[11px] text-muted-foreground"> / 100</span></div><div className="font-mono text-[8px] text-muted-foreground">{describeRisk(result.score)} RISK</div></div></div>
-          {product && <><div className="mt-3 grid grid-cols-2 gap-x-3 gap-y-2 border-t border-line/70 pt-3 sm:grid-cols-3">{productFields.map(({ label, value }) => <div key={label}><div className="font-mono text-[8px] uppercase text-muted-foreground">{label}</div><div className="mt-1 break-all text-[10px]">{value}</div></div>)}</div><div className="mt-3 border-t border-line/70 pt-3"><div className="text-[11px] font-semibold">Why this result?</div><ul className="mt-2 grid gap-1.5 sm:grid-cols-2">{(explanation[status ?? ""] ?? []).slice(0, expandedWhy ? 5 : 4).map((item) => <li key={item} className="flex gap-2 text-[9px] text-muted-foreground"><span className={status === "AUTHENTIC" ? "text-green" : status === "SUSPICIOUS" ? "text-amber" : "text-red"}>{status === "AUTHENTIC" ? "✓" : status === "SUSPICIOUS" ? "!" : "×"}</span>{item}</li>)}</ul>{status === "CLONE SUSPECTED" && <><Button variant="ghost" onClick={() => setExpandedWhy(!expandedWhy)} className="mt-2 h-6 px-1 text-[9px] text-cyan">{expandedWhy ? "Hide scan timeline" : "Show scan timeline"} <ChevronDown size={12} /></Button>{expandedWhy && <div className="mt-1 flex flex-wrap gap-2 font-mono text-[9px] text-red">{product.recentScans.map((scan) => { const label = typeof scan === "string" ? scan : `${scan.location} · ${scan.timeDisplay}`; return <span key={label} className="rounded border border-red/20 bg-background px-2 py-1">{label}</span>; })}</div>}</>}</div></>}
-          {status === "NOT FOUND" && <p className="mt-3 border-t border-line pt-3 text-[10px] text-muted-foreground">This ID isn’t in the demonstration registry. Try one of the sample identities above.</p>}
-          {status && status !== "NOT FOUND" && <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-line/70 pt-3"><div className="flex items-center gap-1.5 font-mono text-[9px] text-muted-foreground"><Zap size={12} className="text-cyan" />Adaptive verification · Level {result.score < 30 ? "1" : result.score < 70 ? "2" : "3"}</div><Button variant="outline" onClick={onRisk} className="h-7 border-line bg-background px-2 text-[9px]">View risk breakdown <ArrowRight size={12} /></Button></div>}
-        </div>}
+        {result && (() => {
+
+          const bcEv = result.blockchainEvidence;
+          const provEv = result.provenanceEvidence;
+          const riskEv = result.riskEvidence;
+          const bcColor = bcEv?.verified ? "text-green" : bcEv?.status === "BLOCKCHAIN_ERROR" ? "text-amber" : "text-red";
+          const bcBorder = bcEv?.verified ? "border-green/25 bg-green/5" : bcEv?.status === "BLOCKCHAIN_ERROR" ? "border-amber/25 bg-amber/5" : "border-red/25 bg-red/5";
+          return (
+            <div className="space-y-3">
+              {/* Panel 1: Final Decision Banner */}
+              <div className={`rounded-md border p-4 ${status === "AUTHENTIC" ? "border-green/30 bg-green/5" : status === "SUSPICIOUS" ? "border-amber/35 bg-amber/5" : status === "INDETERMINATE" ? "border-amber/20 bg-amber/5" : "border-red/35 bg-red/5"}`}>
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div className="flex items-start gap-2.5">
+                    <div className={`grid size-9 shrink-0 place-items-center rounded border ${status === "AUTHENTIC" ? "border-green/30 bg-green/10 text-green" : status === "SUSPICIOUS" ? "border-amber/30 bg-amber/10 text-amber" : "border-red/30 bg-red/10 text-red"}`}>
+                      {status === "AUTHENTIC" ? <ShieldCheck size={19} /> : status === "SUSPICIOUS" ? <AlertTriangle size={19} /> : <ShieldAlert size={19} />}
+                    </div>
+                    <div>
+                      <div className={`font-display text-[15px] font-semibold ${resultColor}`}>
+                        {status === "AUTHENTIC" ? "AUTHENTIC" : status === "SUSPICIOUS" ? "SUSPICIOUS" : status === "NOT FOUND" ? "NOT FOUND" : status === "INDETERMINATE" ? "INDETERMINATE" : "CLONE SUSPECTED"}
+                      </div>
+                      <div className="mt-1 text-[10px] text-muted-foreground">{product?.name ?? result.id} · {product?.manufacturer ?? "No verified manufacturer record"}</div>
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <div className={`font-display text-[25px] font-semibold ${resultColor}`}>{result.score}<span className="text-[11px] text-muted-foreground"> / 100</span></div>
+                    <div className="font-mono text-[8px] text-muted-foreground">{describeRisk(result.score)} RISK</div>
+                  </div>
+                </div>
+                {result.decisionReason && (
+                  <div className="mt-3 border-t border-line/60 pt-3">
+                    <div className="font-mono text-[8px] uppercase text-muted-foreground mb-1">Decision reason</div>
+                    <p className="text-[10px] leading-relaxed">{result.decisionReason}</p>
+                  </div>
+                )}
+                <div className="mt-3 rounded border border-amber/20 bg-amber/5 px-3 py-2">
+                  <p className="text-[9px] text-muted-foreground leading-relaxed">
+                    <span className="font-semibold text-amber">Note: </span>
+                    Blockchain registration confirms digital identity, not physical product authenticity. A verified ledger entry does not guarantee the item in your possession is genuine.
+                  </p>
+                </div>
+              </div>
+
+              {/* Panel 2: Product Identity & Registry */}
+              {product && (
+                <div className="rounded-md border border-line bg-panel p-4">
+                  <div className="mb-2 flex items-center gap-2">
+                    <Database size={13} className="text-cyan" />
+                    <span className="font-mono text-[9px] uppercase text-cyan">Identity &amp; Registry</span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-3 gap-y-2 sm:grid-cols-3">
+                    {[
+                      { label: "Product ID", value: product.id },
+                      { label: "Manufacturer", value: product.manufacturer },
+                      { label: "Batch", value: product.batch },
+                      { label: "Manufactured", value: product.manufactured },
+                      { label: "Serial", value: product.serial ?? "—" },
+                    ].map(({ label, value }) => (
+                      <div key={label}>
+                        <div className="font-mono text-[8px] uppercase text-muted-foreground">{label}</div>
+                        <div className="mt-1 break-all text-[10px]">{value}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Panel 3: Blockchain Integrity */}
+              {bcEv && (
+                <div className={`rounded-md border p-4 ${bcBorder}`}>
+                  <div className="mb-2 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Blocks size={13} className={bcColor} />
+                      <span className={`font-mono text-[9px] uppercase ${bcColor}`}>Blockchain Integrity</span>
+                    </div>
+                    <span className={`font-mono text-[8px] rounded border px-1.5 py-0.5 ${bcBorder} ${bcColor}`}>{bcEv.status}</span>
+                  </div>
+                  <p className="mb-2 text-[10px] text-muted-foreground">{bcEv.message}</p>
+                  <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+                    {bcEv.expectedHash && (
+                      <div>
+                        <div className="font-mono text-[8px] uppercase text-muted-foreground">Expected hash (v1)</div>
+                        <div className="mt-1 break-all font-mono text-[8px]">{bcEv.expectedHash.slice(0, 20)}…</div>
+                      </div>
+                    )}
+                    {bcEv.contractAddress && (
+                      <div>
+                        <div className="font-mono text-[8px] uppercase text-muted-foreground">Contract</div>
+                        <div className="mt-1 break-all font-mono text-[8px]">{bcEv.contractAddress.slice(0, 14)}…</div>
+                      </div>
+                    )}
+                    {bcEv.latestTxHash && (
+                      <div>
+                        <div className="font-mono text-[8px] uppercase text-muted-foreground">Latest tx</div>
+                        <div className="mt-1 break-all font-mono text-[8px]">{bcEv.latestTxHash.slice(0, 14)}…</div>
+                      </div>
+                    )}
+                    <div>
+                      <div className="font-mono text-[8px] uppercase text-muted-foreground">On-chain active</div>
+                      <div className={`mt-1 text-[10px] ${bcEv.onChainActive ? "text-green" : "text-red"}`}>
+                        {bcEv.onChainActive === null ? "Unknown" : bcEv.onChainActive ? "Yes" : "No"}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Panel 4: Supply-chain Provenance */}
+              {provEv && (
+                <div className={`rounded-md border p-4 ${provEv.trailIntact ? "border-green/25 bg-green/5" : "border-amber/25 bg-amber/5"}`}>
+                  <div className="mb-2 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <PackageCheck size={13} className={provEv.trailIntact ? "text-green" : "text-amber"} />
+                      <span className={`font-mono text-[9px] uppercase ${provEv.trailIntact ? "text-green" : "text-amber"}`}>Supply-chain Provenance</span>
+                    </div>
+                    <span className={`font-mono text-[8px] ${provEv.trailIntact ? "text-green" : "text-amber"}`}>
+                      {provEv.eventCount} event{provEv.eventCount !== 1 ? "s" : ""}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 sm:grid-cols-3 text-[10px]">
+                    <div>
+                      <div className="font-mono text-[8px] uppercase text-muted-foreground">Trail intact</div>
+                      <div className={`mt-1 ${provEv.trailIntact ? "text-green" : "text-amber"}`}>{provEv.trailIntact ? "Yes" : "No"}</div>
+                    </div>
+                    {provEv.lastEvent && (
+                      <div>
+                        <div className="font-mono text-[8px] uppercase text-muted-foreground">Last event</div>
+                        <div className="mt-1">{provEv.lastEvent}</div>
+                      </div>
+                    )}
+                    {provEv.lastLocation && (
+                      <div>
+                        <div className="font-mono text-[8px] uppercase text-muted-foreground">Last location</div>
+                        <div className="mt-1">{provEv.lastLocation}</div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Panel 5: Behavioral Risk Breakdown */}
+              {riskEv && (
+                <div className="rounded-md border border-line bg-panel p-4">
+                  <div className="mb-2 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Activity size={13} className="text-cyan" />
+                      <span className="font-mono text-[9px] uppercase text-cyan">Behavioral Risk</span>
+                    </div>
+                    <span className={`font-mono text-[8px] rounded border px-1.5 py-0.5 ${riskEv.riskLevel === "LOW" ? "border-green/25 bg-green/5 text-green" : riskEv.riskLevel === "MEDIUM" ? "border-amber/25 bg-amber/5 text-amber" : "border-red/25 bg-red/5 text-red"}`}>
+                      {riskEv.riskLevel} · {riskEv.totalScore}/100
+                    </span>
+                  </div>
+                  {Object.entries(riskEv.anomalies).length > 0 && (
+                    <div className="mb-2 space-y-1.5">
+                      {Object.entries(riskEv.anomalies).map(([key, val]) => (
+                        <div key={key} className="flex items-center gap-2">
+                          <span className="flex-1 text-[9px] text-muted-foreground">{key.replace(/([A-Z])/g, " $1").trim()}</span>
+                          <span className="font-mono text-[9px]">{val}</span>
+                          <div className="h-1 w-20 rounded bg-background">
+                            <div className="h-1 rounded bg-red" style={{ width: `${Math.min(100, (val as number) * 3)}%` }} />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {riskEv.reasons.length > 0 && (
+                    <ul className="mt-1 space-y-1">
+                      {riskEv.reasons.slice(0, 4).map((r) => (
+                        <li key={r} className="flex gap-2 text-[9px] text-muted-foreground">
+                          <span className="text-amber">!</span>{r}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-line/70 pt-2">
+                    <div className="flex items-center gap-1.5 font-mono text-[9px] text-muted-foreground">
+                      <Zap size={12} className="text-cyan" />Adaptive verification · Level {riskEv.verificationLevel}
+                    </div>
+                    <Button variant="outline" onClick={onRisk} className="h-7 border-line bg-background px-2 text-[9px]">View risk breakdown <ArrowRight size={12} /></Button>
+                  </div>
+                </div>
+              )}
+
+              {/* Fallback for non-API results */}
+              {!bcEv && !provEv && !riskEv && product && (
+                <div className="rounded-md border border-line p-4">
+                  <div className="mt-3 border-t border-line/70 pt-3">
+                    <div className="text-[11px] font-semibold">Why this result?</div>
+                    <ul className="mt-2 grid gap-1.5 sm:grid-cols-2">
+                      {(({ AUTHENTIC: ["Blockchain identity matched", "Metadata hash matches manufacturer record", "Supply-chain history is consistent", "No suspicious duplicate scans", "Recent scan location is expected"], SUSPICIOUS: ["Product identity exists on the ledger", "Blockchain record is valid", "Unusual location change detected", "Multiple recent scans detected", "Enhanced verification is recommended"], "CLONE SUSPECTED": ["Duplicate product identity detected", "Impossible geographic movement flagged", "Unusual scan frequency observed", "Supply-chain record does not match", "Treat this item as potentially counterfeit"] } as Record<string, string[]>)[status ?? ""] ?? []).slice(0, 4).map((item) => (
+                        <li key={item} className="flex gap-2 text-[9px] text-muted-foreground">
+                          <span className={status === "AUTHENTIC" ? "text-green" : status === "SUSPICIOUS" ? "text-amber" : "text-red"}>{status === "AUTHENTIC" ? "✓" : status === "SUSPICIOUS" ? "!" : "×"}</span>{item}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              )}
+
+              {status === "NOT FOUND" && <p className="border-t border-line pt-3 text-[10px] text-muted-foreground">This ID isn't in the demonstration registry. Try one of the sample identities above.</p>}
+            </div>
+          );
+        })()}
+
       </div>
     </div>
+
     <div className="mt-3 grid gap-2 sm:grid-cols-3">{[{ title: "LEVEL 1 · Basic", desc: "Product ID · blockchain record · metadata hash", active: !result || result.score < 30 }, { title: "LEVEL 2 · Enhanced", desc: "Scan history · location signals · purchase evidence", active: !!result && result.score >= 30 && result.score < 70 }, { title: "LEVEL 3 · Advanced", desc: "Provenance · behavior · image and identity evidence", active: !!result && result.score >= 70 }].map((level) => <div key={level.title} className={`rounded-md border px-3 py-2.5 ${level.active ? "border-cyan/30 bg-cyan/5" : "border-line bg-panel/70"}`}><div className={`font-mono text-[9px] ${level.active ? "text-cyan" : "text-muted-foreground"}`}>{level.title}{level.active ? " · SELECTED" : ""}</div><p className="mt-1 text-[9px] leading-relaxed text-muted-foreground">{level.desc}</p></div>)}</div>
   </>;
 }

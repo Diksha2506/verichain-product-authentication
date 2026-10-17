@@ -57,7 +57,8 @@ export type VerificationOutcome =
   | "AUTHENTIC"
   | "SUSPICIOUS"
   | "CLONE SUSPECTED"
-  | "NOT FOUND";
+  | "NOT FOUND"
+  | "INDETERMINATE";
 
 // ─── Request / Response ───────────────────────────────────────────────────────
 
@@ -66,11 +67,38 @@ export interface VerificationRequest {
   productId: string;
 }
 
+export interface BlockchainEvidence {
+  status: string;
+  message: string;
+  verified: boolean;
+  onChainActive?: boolean | null;
+  expectedHash?: string | null;
+  contractAddress?: string | null;
+  latestTxHash?: string | null;
+}
+
+export interface ProvenanceEvidence {
+  eventCount: number;
+  trailIntact: boolean;
+  lastEvent?: string | null;
+  lastLocation?: string | null;
+  lastTimestamp?: string | null;
+}
+
+export interface RiskEvidence {
+  totalScore: number;
+  riskLevel: string;
+  verificationLevel: number;
+  reasons: string[];
+  anomalies: Record<string, number>;
+}
+
 /** Full structured response from the verification service. */
 export interface VerificationResponse {
   requestId: string;
   productId: string;
   outcome: VerificationOutcome;
+  decisionReason?: string;
   /** Null when outcome is NOT_FOUND. */
   product: Product | null;
   riskAssessment: RiskAssessment;
@@ -86,6 +114,9 @@ export interface VerificationResponse {
   verifiedAt: string;
   /** ISO-8601 for sorting / backend storage. */
   verifiedAtIso: string;
+  blockchainEvidence?: BlockchainEvidence;
+  provenanceEvidence?: ProvenanceEvidence;
+  riskEvidence?: RiskEvidence;
 }
 
 // ─── History / scan records ───────────────────────────────────────────────────

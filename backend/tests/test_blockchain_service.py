@@ -219,7 +219,7 @@ class TestVerificationDecisionRules:
         _seed_manufacturers(db_session)
         _seed_products(db_session)
 
-        with patch("app.api.verification.check_blockchain_verification") as mock_bc:
+        with patch("app.services.unified_verification_service.check_blockchain_verification") as mock_bc:
             mock_bc.return_value = {
                 "status": "HASH_MISMATCH",
                 "message": "Data integrity error. Blockchain hash does not match database hash."
@@ -237,7 +237,7 @@ class TestVerificationDecisionRules:
         _seed_manufacturers(db_session)
         _seed_products(db_session)
 
-        with patch("app.api.verification.check_blockchain_verification") as mock_bc:
+        with patch("app.services.unified_verification_service.check_blockchain_verification") as mock_bc:
             mock_bc.return_value = {
                 "status": "INACTIVE",
                 "message": "Product is registered but marked inactive."
@@ -254,7 +254,7 @@ class TestVerificationDecisionRules:
         _seed_manufacturers(db_session)
         _seed_products(db_session)
 
-        with patch("app.api.verification.check_blockchain_verification") as mock_bc:
+        with patch("app.services.unified_verification_service.check_blockchain_verification") as mock_bc:
             mock_bc.return_value = {
                 "status": "BLOCKCHAIN_ERROR",
                 "message": "Could not connect to blockchain node."
@@ -272,7 +272,7 @@ class TestVerificationDecisionRules:
         _seed_products(db_session)
         _seed_verification_scans(db_session)
 
-        with patch("app.api.verification.check_blockchain_verification") as mock_bc:
+        with patch("app.services.unified_verification_service.check_blockchain_verification") as mock_bc:
             mock_bc.return_value = {
                 "status": "VERIFIED",
                 "message": "Product identity matches blockchain record."

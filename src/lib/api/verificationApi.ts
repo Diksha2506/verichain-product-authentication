@@ -154,6 +154,36 @@ export async function verifyProduct(
         cloneDetected: data.cloneDetected,
         verifiedAt: data.verifiedAt,
         verifiedAtIso: data.verifiedAtIso,
+        decisionReason: data.decisionReason,
+        blockchainEvidence: data.blockchainEvidence
+          ? {
+              status: data.blockchainEvidence.status,
+              message: data.blockchainEvidence.message,
+              verified: data.blockchainEvidence.verified,
+              onChainActive: data.blockchainEvidence.on_chain_active,
+              expectedHash: data.blockchainEvidence.expected_hash,
+              contractAddress: data.blockchainEvidence.contract_address,
+              latestTxHash: data.blockchainEvidence.latest_tx_hash,
+            }
+          : undefined,
+        provenanceEvidence: data.provenanceEvidence
+          ? {
+              eventCount: data.provenanceEvidence.event_count,
+              trailIntact: data.provenanceEvidence.trail_intact,
+              lastEvent: data.provenanceEvidence.last_event,
+              lastLocation: data.provenanceEvidence.last_location,
+              lastTimestamp: data.provenanceEvidence.last_timestamp,
+            }
+          : undefined,
+        riskEvidence: data.riskEvidence
+          ? {
+              totalScore: data.riskEvidence.total_score,
+              riskLevel: data.riskEvidence.risk_level,
+              verificationLevel: data.riskEvidence.verification_level,
+              reasons: data.riskEvidence.reasons,
+              anomalies: data.riskEvidence.anomalies,
+            }
+          : undefined,
       }
     };
   } catch (err) {

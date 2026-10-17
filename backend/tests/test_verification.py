@@ -12,7 +12,7 @@ def test_verification_nike(client, db_session):
     _seed_verification_scans(db_session)
     
     from unittest.mock import patch
-    with patch("app.api.verification.check_blockchain_verification") as mock_bc:
+    with patch("app.services.unified_verification_service.check_blockchain_verification") as mock_bc:
         mock_bc.return_value = {"status": "VERIFIED", "message": "Product identity matches blockchain record."}
         resp = client.post("/api/products/VC-NIKE-001/verify")
     assert resp.status_code == 200
@@ -31,7 +31,10 @@ def test_verification_sony(client, db_session):
     _seed_products(db_session)
     _seed_verification_scans(db_session)
     
-    resp = client.post("/api/products/VC-SONY-003/verify")
+    from unittest.mock import patch
+    with patch("app.services.unified_verification_service.check_blockchain_verification") as mock_bc:
+        mock_bc.return_value = {"status": "VERIFIED", "message": "Product identity matches blockchain record."}
+        resp = client.post("/api/products/VC-SONY-003/verify")
     assert resp.status_code == 200
     data = resp.json()
     assert data["outcome"] == "SUSPICIOUS"
