@@ -133,7 +133,6 @@ async function main() {
     }
 
     // Save results next to this script for reference
-    const outputPath = path.join(__dirname, "..", "deployed.json");
     fs.writeFileSync(
         outputPath,
         JSON.stringify({ contractAddress, products: results }, null, 2),

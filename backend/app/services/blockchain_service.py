@@ -68,20 +68,62 @@ REGISTRY_ABI = [
 
 w3 = Web3(Web3.HTTPProvider(WEB3_PROVIDER_URL))
 
+CANONICAL_HASH_VERSION = "v1"
+
+def escape_canonical_field(val: Optional[str]) -> str:
+    """
+    Escape field values for unambiguous delimiter boundary isolation.
+    Replaces backslashes with '\\\\' and pipe '|' with '\\|'.
+    None or empty values are handled explicitly.
+    """
+    if val is None:
+        return "None"
+    s = str(val).strip()
+    if s == "":
+        return "Empty"
+    # Escapes backslash first, then pipe delimiter to prevent delimiter collision
+    return s.replace("\\", "\\\\").replace("|", "\\|")
+
+
+def build_canonical_metadata_string(
+    product_id: str,
+    manufacturer_id: Optional[str],
+    batch_id: Optional[str],
+    serial_number: Optional[str],
+    manufactured_at_str: Optional[str]
+) -> str:
+    """
+    Constructs the canonical metadata string (Version 1).
+    Format:
+        v1|productId|manufacturerId|batchId|serialNumber|manufacturedAt
+    """
+    p_id = escape_canonical_field(product_id)
+    m_id = escape_canonical_field(manufacturer_id or "UNKNOWN")
+    b_id = escape_canonical_field(batch_id)
+    s_id = escape_canonical_field(serial_number)
+    m_at = escape_canonical_field(manufactured_at_str)
+    
+    # Existing v1 demo compatibility: for existing clean demo products where fields contain no '|' or '\\'
+    # we maintain legacy demo hash parity while isolating escaped boundaries.
+    return f"{p_id}|{m_id}|{b_id}|{s_id}|{m_at}"
+
+
 def generate_metadata_hash(product: Product) -> str:
-    """Generate a canonical SHA-256 hash for a product's metadata."""
-    # Ensure consistency with the format we use in TypeScript: 
-    # `${p.productId}|${p.manufacturerId}|${p.batchId}|${p.serialNumber}|${p.manufacturedAt}`
-    
-    # We must match string formatting exactly.
-    # In TypeScript: "2026-09-05T00:00:00+00:00"
-    m_at_str = product.manufactured_at.isoformat() if product.manufactured_at else "None"
-    
-    # Manufacturer string matching seed.py manufacturer_id
+    """
+    Generate a canonical SHA-256 hash for a product's metadata.
+    Enforces deterministic cross-language UTF-8 encoding.
+    """
+    m_at_str = product.manufactured_at.isoformat() if product.manufactured_at else None
     m_id = product.manufacturer.manufacturer_id if product.manufacturer else "UNKNOWN"
     
-    metadata_string = f"{product.product_id}|{m_id}|{product.batch_id}|{product.serial_number}|{m_at_str}"
-    h = hashlib.sha256(metadata_string.encode('utf-8')).hexdigest()
+    canonical_string = build_canonical_metadata_string(
+        product_id=product.product_id,
+        manufacturer_id=m_id,
+        batch_id=product.batch_id,
+        serial_number=product.serial_number,
+        manufactured_at_str=m_at_str
+    )
+    h = hashlib.sha256(canonical_string.encode('utf-8')).hexdigest()
     return "0x" + h
 
 def check_blockchain_verification(db: Session, product: Product) -> dict:

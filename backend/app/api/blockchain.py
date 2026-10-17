@@ -85,10 +85,12 @@ def register_product_on_chain(product_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Blockchain transaction failed: {str(e)}")
 
     now = datetime.now(timezone.utc)
+    raw_tx_hex = receipt.transactionHash.hex()
+    tx_hash_hex = raw_tx_hex if raw_tx_hex.startswith("0x") else f"0x{raw_tx_hex}"
     
     tx_record = BlockchainTransaction(
         product_id=product.id,
-        transaction_hash=receipt.transactionHash.hex(),
+        transaction_hash=tx_hash_hex,
         block_number=receipt.blockNumber,
         transaction_type="REGISTRATION",
         metadata_hash=metadata_hash,

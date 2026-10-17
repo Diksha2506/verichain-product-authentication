@@ -100,6 +100,18 @@ class TestGenerateMetadataHash:
         p_str = make_product("VC-1", "MFG-1", "B-1", "SN-1", "2026-01-01T00:00:00+00:00")
         assert generate_metadata_hash(p_none) != generate_metadata_hash(p_str)
 
+    def test_delimiter_collision_prevented_by_escaping(self):
+        """
+        Verify that field value containing delimiter '|' does not produce the same hash
+        as a boundary-shifted product (prevents field boundary injection).
+        Example:
+          Prod A: id='VC|1', mfg='MFG'
+          Prod B: id='VC', mfg='1|MFG'
+        """
+        p_a = make_product("VC|1", "MFG", "B1", "SN1", "2026-01-01T00:00:00+00:00")
+        p_b = make_product("VC", "1|MFG", "B1", "SN1", "2026-01-01T00:00:00+00:00")
+        assert generate_metadata_hash(p_a) != generate_metadata_hash(p_b)
+
 
 class TestCheckBlockchainVerification:
     """Tests for the blockchain verification function (mocked network)."""
