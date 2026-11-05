@@ -124,39 +124,82 @@ def _seed_products(db):
 
 
 # ─── Supply-chain events ──────────────────────────────────────────────────────
+#
+# Per-product custody trails. Each product is seeded independently, so running
+# this twice never duplicates records, and products that are intentionally left
+# without a provenance trail (VC-SONY-003, VC-FAKE-999) never receive one.
+#
+# NOTE: the Apple transaction references below are SYNTHETIC DEMONSTRATION
+# LABELS ("demo-tx-…"), not real blockchain transactions. They exist only to
+# make the demo custody trail readable.
+
+SUPPLY_CHAIN_EVENTS = {
+    "VC-NIKE-001": [
+        dict(event_type="MANUFACTURED",
+             actor_id="MFG-NIKE-US", location="Beaverton, Oregon, US",
+             latitude=45.5231, longitude=-122.6765,
+             timestamp=_utc("2026-09-05T08:14:00Z"),
+             transaction_reference="0x7a91e82c"),
+        dict(event_type="SHIPPED",
+             actor_id="DIST-WESTCOAST", location="Oakland, California, US",
+             latitude=37.8044, longitude=-122.2712,
+             timestamp=_utc("2026-09-08T16:32:00Z"),
+             transaction_reference="0x23d8901b"),
+        dict(event_type="RECEIVED_RETAIL",
+             actor_id="RETAIL-UNION-SF", location="San Francisco, California, US",
+             latitude=37.7749, longitude=-122.4194,
+             timestamp=_utc("2026-09-12T10:06:00Z"),
+             transaction_reference="0x99a210df"),
+        dict(event_type="SOLD",
+             actor_id="CONSUMER", location="Portland, Oregon, US",
+             latitude=45.5231, longitude=-122.6765,
+             timestamp=_utc("2026-09-18T13:42:00Z"),
+             transaction_reference="0x61ce13ae"),
+    ],
+    "VC-APPLE-002": [
+        dict(event_type="MANUFACTURED",
+             actor_id="MFG-APPLE-US", location="Cupertino, California, US",
+             latitude=37.3230, longitude=-122.0322,
+             timestamp=_utc("2026-08-18T07:45:00Z"),
+             transaction_reference="demo-tx-apple-0001"),
+        dict(event_type="SHIPPED",
+             actor_id="DIST-APPLE-LOUISVILLE", location="Louisville, Kentucky, US",
+             latitude=38.2527, longitude=-85.7585,
+             timestamp=_utc("2026-08-25T14:20:00Z"),
+             transaction_reference="demo-tx-apple-0002"),
+        dict(event_type="RECEIVED_RETAIL",
+             actor_id="RETAIL-APPLE-UNION-SQ", location="San Francisco, California, US",
+             latitude=37.7749, longitude=-122.4194,
+             timestamp=_utc("2026-09-02T09:15:00Z"),
+             transaction_reference="demo-tx-apple-0003"),
+        dict(event_type="SOLD",
+             actor_id="CONSUMER", location="San Jose, California, US",
+             latitude=37.3382, longitude=-121.8863,
+             timestamp=_utc("2026-09-10T18:05:00Z"),
+             transaction_reference="demo-tx-apple-0004"),
+    ],
+}
+
 
 def _seed_supply_chain(db):
-    nike = db.query(Product).filter_by(product_id="VC-NIKE-001").first()
-    # Only seed if events don't exist
-    if db.query(SupplyChainEvent).filter_by(product_id=nike.id).first():
-        print("  [OK] Supply chain (already seeded)")
-        return
-
-    events = [
-        SupplyChainEvent(product_id=nike.id, event_type="MANUFACTURED",
-            actor_id="MFG-NIKE-US", location="Beaverton, Oregon, US",
-            latitude=45.5231, longitude=-122.6765,
-            timestamp=_utc("2026-09-05T08:14:00Z"),
-            transaction_reference="0x7a91e82c"),
-        SupplyChainEvent(product_id=nike.id, event_type="SHIPPED",
-            actor_id="DIST-WESTCOAST", location="Oakland, California, US",
-            latitude=37.8044, longitude=-122.2712,
-            timestamp=_utc("2026-09-08T16:32:00Z"),
-            transaction_reference="0x23d8901b"),
-        SupplyChainEvent(product_id=nike.id, event_type="RECEIVED_RETAIL",
-            actor_id="RETAIL-UNION-SF", location="San Francisco, California, US",
-            latitude=37.7749, longitude=-122.4194,
-            timestamp=_utc("2026-09-12T10:06:00Z"),
-            transaction_reference="0x99a210df"),
-        SupplyChainEvent(product_id=nike.id, event_type="SOLD",
-            actor_id="CONSUMER", location="Portland, Oregon, US",
-            latitude=45.5231, longitude=-122.6765,
-            timestamp=_utc("2026-09-18T13:42:00Z"),
-            transaction_reference="0x61ce13ae"),
-    ]
-    db.bulk_save_objects(events)
-    db.commit()
-    print("  [OK] Supply chain events")
+    """Seed each product's custody trail behind its own idempotency guard."""
+    inserted = 0
+    for product_id, events in SUPPLY_CHAIN_EVENTS.items():
+        product = db.query(Product).filter_by(product_id=product_id).first()
+        if product is None:
+            print(f"  [SKIP] Supply chain for {product_id} (product not present)")
+            continue
+        if db.query(SupplyChainEvent).filter_by(product_id=product.id).first():
+            print(f"  [OK] Supply chain for {product_id} (already seeded)")
+            continue
+        db.bulk_save_objects(
+            [SupplyChainEvent(product_id=product.id, **event) for event in events]
+        )
+        db.commit()
+        inserted += len(events)
+        print(f"  [OK] Supply chain for {product_id} ({len(events)} events)")
+    if not inserted:
+        print("  [OK] Supply chain (nothing to insert)")
 
 
 # ─── Verification scans ───────────────────────────────────────────────────────

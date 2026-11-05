@@ -235,9 +235,13 @@ class TestOrchestrateVerificationPipeline:
         assert data["outcome"] == "INDETERMINATE"
 
     def test_clone_suspected_for_fake_product(self, client, db_session):
-        """VC-FAKE-999 has CRITICAL risk => CLONE SUSPECTED (no blockchain mock needed)."""
+        """VC-FAKE-999 has CRITICAL risk => CLONE SUSPECTED (blockchain mocked VERIFIED)."""
         self._seed(db_session)
-        resp = client.post("/api/products/VC-FAKE-999/verify")
+        with patch(
+            "app.services.unified_verification_service.check_blockchain_verification",
+            return_value={"status": "VERIFIED", "message": "OK"},
+        ):
+            resp = client.post("/api/products/VC-FAKE-999/verify")
         assert resp.status_code == 200
         data = resp.json()
         assert data["outcome"] == "CLONE SUSPECTED"

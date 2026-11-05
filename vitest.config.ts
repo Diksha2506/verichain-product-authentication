@@ -9,6 +9,9 @@ export default defineConfig({
     globals: true,
     setupFiles: ["./src/test/setup.ts"],
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
+    // The service-layer tests assert the deterministic offline mock path; the
+    // application itself defaults to the live backend (see API_CONFIG).
+    env: { VITE_USE_MOCK: "true" },
   },
   resolve: {
     alias: { "@": path.resolve(__dirname, "./src") },

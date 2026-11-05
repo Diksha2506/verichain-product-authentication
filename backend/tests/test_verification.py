@@ -47,7 +47,14 @@ def test_verification_fake(client, db_session):
     _seed_products(db_session)
     _seed_verification_scans(db_session)
     
-    resp = client.post("/api/products/VC-FAKE-999/verify")
+    # VC-FAKE-999 carries CRITICAL behavioral risk; the CLONE SUSPECTED outcome
+    # only results from a VERIFIED blockchain identity (the policy table early-
+    # returns SUSPICIOUS/INDETERMINATE for NOT_REGISTERED/BLOCKCHAIN_ERROR), so
+    # mock the chain check like the sibling tests — deterministic, no Hardhat.
+    from unittest.mock import patch
+    with patch("app.services.unified_verification_service.check_blockchain_verification") as mock_bc:
+        mock_bc.return_value = {"status": "VERIFIED", "message": "Product identity matches blockchain record."}
+        resp = client.post("/api/products/VC-FAKE-999/verify")
     assert resp.status_code == 200
     data = resp.json()
     assert data["outcome"] == "CLONE SUSPECTED"

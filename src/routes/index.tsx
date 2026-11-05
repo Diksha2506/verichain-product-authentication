@@ -8,15 +8,29 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import QRCode from "qrcode";
+import { encodeQrPayload } from "@/lib/qr";
+import {
+  classifyCameraError,
+  compareHintForRun,
+  createDecodeGuard,
+  getBarcodeDetectorCtor,
+  hintNotice,
+  resolveScannedInput,
+  shouldClearRunningQrNotice,
+  stopCameraStream,
+} from "@/lib/qrScan";
+import type { QrHint, ScanResolution } from "@/lib/qrScan";
 import { calculateRisk, describeRisk, riskFactorRows } from "@/lib/riskEngine";
-import { getProduct, getProducts, getVerificationHistory, verifyProduct as verifyProductMock, getBlockchainTransactions } from "@/lib/mockApi";
+import { getProduct, getProducts, getVerificationHistory, verifyProduct as verifyProductMock } from "@/lib/mockApi";
 import { verifyProduct, API_CONFIG } from "@/lib/api";
+import { useLedgerTransactions, useNetworkStatus } from "@/hooks/useBlockchain";
+import type { NetworkStatus } from "@/types/blockchain";
 import type { Product } from "@/types/product";
 import type { BlockchainEvidence, ProvenanceEvidence, RiskEvidence, VerificationState } from "@/types/verification";
 
 // ─── Service-layer data (components must not import mockData directly) ────────
 const products = getProducts();
-const demoTransactions = getBlockchainTransactions();
 const recentActivity = getVerificationHistory();
 
 export const Route = createFileRoute("/")({
@@ -39,6 +53,13 @@ type Result = {
   status: Product["status"] | "NOT FOUND" | "INDETERMINATE";
   score: number;
   decisionReason?: string;
+  /**
+   * Metadata hash bound to this run's QR flows (Phase 7B.2): the canonical
+   * 0x-stripped hash from the verification response when one is valid, or ""
+   * when no canonical hash is available ("QR seal unavailable"). QR dialogs
+   * fall back to a product's own demo hash only in mock mode.
+   */
+  metadataHash?: string;
   blockchainEvidence?: BlockchainEvidence;
   provenanceEvidence?: ProvenanceEvidence;
   riskEvidence?: RiskEvidence;
@@ -83,6 +104,20 @@ function VeriChainApp() {
   const [expandedWhy, setExpandedWhy] = useState(false);
   const [fileName, setFileName] = useState("");
   const [notice, setNotice] = useState("");
+  // Monotonic verification-run id (audit fix): every run start increments it;
+  // asynchronous completions are discarded unless their captured id is still
+  // current, so a stale response can never overwrite a newer product, result,
+  // progress state, or notice.
+  const verifyRunIdRef = useRef(0);
+  // Untrusted hash prefix captured from a scanned seal (Phase 6.3), stored with
+  // the run id it belongs to; read only after that same run completes. A ref
+  // avoids retriggering the step effect.
+  const scannedHashHintRef = useRef<QrHint | null>(null);
+  // Run id that currently owns the temporary "QR seal read — running…"
+  // notice set by a scan (Phase 6.3 audit fix). Cleared together with the
+  // notice (or when a verdict replaces it) so the notice can never outlive —
+  // or be cleared on behalf of — a different run.
+  const runningQrNoticeRunRef = useRef<number | null>(null);
   const [registrySearch, setRegistrySearch] = useState("");
   const [pageNumber, setPageNumber] = useState(1);
   const [registrationStep, setRegistrationStep] = useState(0);
@@ -91,33 +126,71 @@ function VeriChainApp() {
 
   useEffect(() => {
     if (step < 0 || step >= 5) return;
+    // Capture at scheduling time: each timer belongs to exactly this run.
+    const runId = verifyRunIdRef.current;
     const timer = window.setTimeout(async () => {
       const nextStep = step + 1;
+      // Clear the temporary "QR seal read — running…" banner when (and only
+      // when) the run that set it is the run that just completed.
+      const clearRunningQrNoticeForRun = () => {
+        if (shouldClearRunningQrNotice(runningQrNoticeRunRef.current, runId)) {
+          setNotice("");
+          runningQrNoticeRunRef.current = null;
+        }
+      };
       if (nextStep >= 5) {
         const apiResult = await verifyProduct({ productId });
+        // A newer verification started while awaiting: discard this response
+        // wholesale — never overwrite the newer product, result, or notice.
+        if (verifyRunIdRef.current !== runId) return;
         if (apiResult.ok) {
           const d = apiResult.data;
           setResult({
             id: d.productId,
             status: (d.outcome === "NOT FOUND" ? "NOT FOUND" : d.outcome) as Result["status"],
             score: d.riskAssessment.totalScore,
-            decisionReason: d.decisionReason,
-            blockchainEvidence: d.blockchainEvidence,
-            provenanceEvidence: d.provenanceEvidence,
-            riskEvidence: d.riskEvidence,
+            ...(d.decisionReason !== undefined ? { decisionReason: d.decisionReason } : {}),
+            ...(d.product ? { metadataHash: d.product.metadataHash } : {}),
+            ...(d.blockchainEvidence !== undefined ? { blockchainEvidence: d.blockchainEvidence } : {}),
+            ...(d.provenanceEvidence !== undefined ? { provenanceEvidence: d.provenanceEvidence } : {}),
+            ...(d.riskEvidence !== undefined ? { riskEvidence: d.riskEvidence } : {}),
           });
+          // Hint-only consistency check against the trusted metadata hash of
+          // the verified result. It never changes the outcome or the flow, and
+          // the hint is honored only for the run the seal was scanned in.
+          const verdict = compareHintForRun(
+            scannedHashHintRef.current,
+            runId,
+            d.product?.metadataHash ?? null
+          );
+          if (verdict) {
+            setNotice(hintNotice(verdict));
+            scannedHashHintRef.current = null;
+            runningQrNoticeRunRef.current = null;
+          } else {
+            // This completed run still owns the temporary "QR seal read —
+            // running…" banner and there is no hint verdict to show in its
+            // place: clear it. Match/mismatch/unknown verdicts, and notices
+            // belonging to a newer run, are never cleared here.
+            clearRunningQrNoticeForRun();
+          }
         } else {
           // If in mock mode, use the mock data. If in real API mode, display the explicit error notice without silently returning mock results.
           if (API_CONFIG.USE_MOCK) {
             const found = verifyProductMock(productId);
             setResult({ id: productId.toUpperCase().trim(), status: found.product?.status ?? "NOT FOUND", score: found.riskScore });
+            clearRunningQrNoticeForRun();
           } else {
             setResult(null);
             setNotice(`Backend verification failed: ${apiResult.error ?? "API unavailable"}`);
           }
         }
         setStep(5);
-      } else setStep(nextStep);
+      } else {
+        // A newer run began before this timer fired: do not advance its state.
+        if (verifyRunIdRef.current !== runId) return;
+        setStep(nextStep);
+      }
     }, 650);
     return () => window.clearTimeout(timer);
   }, [step, productId]);
@@ -125,6 +198,10 @@ function VeriChainApp() {
   const runVerification = (id = productId) => {
     const normalized = id.trim().toUpperCase();
     if (!normalized) { setNotice("Enter a product ID to begin verification."); return; }
+    // Open a new run identity FIRST: pending completions and step timers of
+    // older runs are discarded, and any stored seal hint dies with its own run.
+    verifyRunIdRef.current += 1;
+    scannedHashHintRef.current = null; // manual verifications carry no seal hint
     setNotice("");
     setProductId(normalized);
     setResult(null);
@@ -137,7 +214,38 @@ function VeriChainApp() {
     runVerification(id);
   };
 
-  const searchMatches = search.trim() ? products.filter((product) => `${product.name} ${product.id} ${product.manufacturer} ${product.batch}`.toLowerCase().includes(search.toLowerCase())) : [];
+  /**
+   * Phase 6.3 — entry point for a scanned or pasted QR seal / product ID.
+   * Everything below the guard is the ordinary manual verification flow; the
+   * QR contributes only the validated product ID (and an untrusted hash prefix
+   * kept solely as a consistency hint checked after verification completes).
+   */
+  const handleQrScan = (scan: ScanResolution) => {
+    if (scan.ok) {
+      setScannerOpen(false);
+      // Call the starter first: it opens a fresh run (increments the run id and
+      // clears any stored hint), so stale hints and in-flight earlier runs stop
+      // applying. The untrusted hint from this scan is written AFTER the
+      // starter and tagged with the new run id so it binds to exactly this run
+      // when the verification completes.
+      runVerification(scan.productId);
+      scannedHashHintRef.current = scan.isQrPayload
+        ? { runId: verifyRunIdRef.current, hashPrefix: scan.hashPrefix }
+        : null;
+      setNotice(
+        scan.hashPrefix
+          ? "QR seal read — running the live verification check…"
+          : "Product identity read — running the live verification check…"
+      );
+      // Bind the temporary running notice to exactly this verification run so
+      // it can be cleared when this run completes without a hint verdict.
+      runningQrNoticeRunRef.current = verifyRunIdRef.current;
+    } else {
+      setNotice(`QR payload rejected: ${scan.error}`);
+    }
+  };
+
+  const searchMatches = search.trim() ? products.filter((product) => `${product.name} ${product.id} ${product.manufacturer} ${product.batchId}`.toLowerCase().includes(search.toLowerCase())) : [];
 
   return (
     <div className="instrument-grid min-h-screen overflow-x-hidden bg-background text-foreground">
@@ -146,11 +254,7 @@ function VeriChainApp() {
         <aside className="sticky top-0 hidden h-screen w-[226px] shrink-0 flex-col border-r border-line bg-background/95 px-3 py-4 lg:flex">
           <Brand />
           <Sidebar page={page} onNavigate={setPage} />
-          <div className="mt-auto rounded-md border border-line bg-panel p-3">
-            <div className="flex items-center gap-2 text-[10px] font-mono text-green"><span className="instrument-pulse size-1.5 rounded-full bg-green" />NETWORK CONNECTED</div>
-            <div className="mt-2 font-mono text-[10px] text-muted-foreground">Block 18,429,703</div>
-            <div className="mt-1 font-mono text-[10px] text-muted-foreground">Finality · 2.4 sec</div>
-          </div>
+          <ChainStatusCard />
         </aside>
 
         <div className="flex min-w-0 flex-1 flex-col pb-[72px] lg:pb-0">
@@ -169,7 +273,7 @@ function VeriChainApp() {
                   {searchMatches.length ? searchMatches.map((product) => <button key={product.id} onClick={() => { setSearch(""); runVerification(product.id); }} className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left hover:bg-panel-raised"><span className="min-w-0 truncate text-xs">{product.name}</span><span className="shrink-0 font-mono text-[10px] text-cyan">{product.id}</span></button>) : <p className="p-3 text-xs text-muted-foreground">No matching product found.</p>}
                 </div>}
               </div>
-              <div className="hidden items-center gap-1.5 rounded-md border border-green/25 bg-green/5 px-2.5 py-2 font-mono text-[10px] text-green md:flex"><span className="instrument-pulse size-1.5 rounded-full bg-green" />LEDGER LIVE</div>
+              <ChainStatusBadge className="hidden md:flex" />
               <Button onClick={() => { setPage("alerts"); setMobileOpen(false); }} variant="outline" size="icon" aria-label="View alerts" className="h-9 w-9 border-line bg-panel text-muted-foreground"><AlertTriangle size={16} /></Button>
               <div className="grid size-9 place-items-center rounded-md border border-cyan/30 bg-cyan/10 text-xs font-semibold text-cyan">VC</div>
             </div>
@@ -195,17 +299,7 @@ function VeriChainApp() {
         {[{ page: "overview" as Page, label: "Overview", icon: LayoutDashboard }, { page: "verify" as Page, label: "Verify", icon: Fingerprint }, { page: "registry" as Page, label: "Registry", icon: Box }, { page: "alerts" as Page, label: "Alerts", icon: CircleAlert }, { page: "risk" as Page, label: "Risk", icon: Gauge }].map(({ page: target, label, icon: Icon }) => <button key={target} onClick={() => setPage(target)} className={`flex min-w-0 flex-col items-center justify-center gap-1 text-[10px] ${page === target ? "text-cyan" : "text-muted-foreground"}`}><Icon size={17} /><span>{label}</span></button>)}
       </nav>
 
-      {scannerOpen && <Modal title="QR scanner" onClose={() => setScannerOpen(false)}>
-        <div className="mx-auto max-w-sm text-center">
-          <div className="relative mx-auto my-5 grid size-52 place-items-center overflow-hidden rounded-lg border border-cyan/40 bg-background instrument-grid">
-            <div className="absolute inset-5 border border-cyan/70"><span className="absolute inset-x-0 top-1/3 h-px bg-cyan shadow-[0_0_12px_var(--cyan)] instrument-scan" /></div>
-            <div className="grid size-24 grid-cols-5 gap-1 p-2 opacity-75" aria-label="Sample QR code">{Array.from({ length: 25 }, (_, i) => <span key={i} className={`rounded-[1px] ${[0,1,2,4,6,8,10,11,12,14,15,17,18,20,22,23,24].includes(i) ? "bg-cyan" : "bg-muted/30"}`} />)}</div>
-            <div className="absolute bottom-2 font-mono text-[9px] text-cyan">CAMERA SIMULATION</div>
-          </div>
-          <p className="text-sm text-muted-foreground">Camera access is not needed for this product demo.</p>
-          <Button onClick={() => { setScannerOpen(false); startDemo("VC-NIKE-001"); }} className="mt-4 w-full"><Fingerprint size={16} /> Use demo product</Button>
-        </div>
-      </Modal>}
+      {scannerOpen && <QrScannerModal onClose={() => setScannerOpen(false)} onScanned={handleQrScan} />}
     </div>
   );
 }
@@ -214,6 +308,43 @@ function Brand() {
   return <div className="mb-5 flex h-11 items-center gap-2.5 border-b border-line px-2 pb-4">
     <div className="grid size-8 place-items-center rounded-md border border-cyan/30 bg-cyan/10 text-cyan"><Shield size={17} /></div>
     <div className="leading-tight"><div className="text-[15px] font-semibold">VeriChain</div><div className="mt-1 font-mono text-[9px] uppercase text-muted-foreground">Trust layer</div></div>
+  </div>;
+}
+
+/**
+ * The chain is "live" only when the backend can read the node AND the node
+ * reports the expected chain id. Anything else is surfaced as unavailable.
+ */
+function chainIsLive(status: NetworkStatus | null): boolean {
+  return Boolean(status?.connected && status.chainIdMatches);
+}
+
+/** Sidebar panel: real network, chain id, block height and contract address. */
+function ChainStatusCard() {
+  const { data, loading, error } = useNetworkStatus();
+  const live = chainIsLive(data);
+  const tone = loading ? "text-muted-foreground" : live ? "text-green" : "text-amber";
+  const label = loading ? "CHECKING LEDGER" : live ? "NETWORK CONNECTED" : "LEDGER UNAVAILABLE";
+  const chain = data?.chainId != null ? `${data.networkName} · Chain ${data.chainId}` : "Unavailable";
+  return <div className="mt-auto rounded-md border border-line bg-panel p-3">
+    <div className={`flex items-center gap-2 font-mono text-[10px] ${tone}`}><span className={`size-1.5 rounded-full ${loading ? "bg-muted-foreground" : live ? "instrument-pulse bg-green" : "bg-amber"}`} />{label}</div>
+    <div className="mt-2 truncate font-mono text-[10px] text-muted-foreground">{chain}</div>
+    <div className="mt-1 font-mono text-[10px] text-muted-foreground">{data?.blockNumber != null ? `Block ${data.blockNumber.toLocaleString("en-US")}` : "Block unavailable"}</div>
+    <div className="mt-1 truncate font-mono text-[9px] text-muted-foreground">{data?.contractAddress ? `Contract ${data.contractAddress.slice(0, 10)}…${data.contractAddress.slice(-4)}` : "Contract unavailable"}</div>
+    {data && !data.contractDeployed && <div className="mt-1 font-mono text-[8px] text-amber">Registry contract not deployed</div>}
+    {error && <div className="mt-1 break-words font-mono text-[8px] text-amber">{error}</div>}
+  </div>;
+}
+
+/** Compact badge used in the header and on the verification screen. */
+function ChainStatusBadge({ className = "" }: { className?: string }) {
+  const { data, loading } = useNetworkStatus();
+  const live = chainIsLive(data);
+  const tone = loading ? "border-line bg-background text-muted-foreground" : live ? "border-green/25 bg-green/5 text-green" : "border-amber/25 bg-amber/5 text-amber";
+  const label = loading ? "CHECKING LEDGER" : live ? "LEDGER LIVE" : "LEDGER UNAVAILABLE";
+  return <div className={`flex items-center gap-1.5 rounded border px-2.5 py-2 font-mono text-[9px] ${tone} ${className}`}>
+    <span className={`size-1.5 rounded-full ${live ? "instrument-pulse bg-green" : "bg-amber"}`} />
+    {label}
   </div>;
 }
 
@@ -259,10 +390,10 @@ function Overview({ onNavigate, onVerify, onHistory, onDemo, demoOpen, onDemoPic
       { id: "VC-FAKE-999", label: "Clone detected", icon: ShieldAlert, color: "text-red" },
     ].map(({ id, label, icon: Icon, color }) => <button onClick={() => onDemoPick(id)} key={id} className="flex min-h-11 items-center gap-2.5 rounded border border-line bg-background px-3 text-left text-xs hover:border-cyan/50"><Icon size={16} className={color} /><span className="flex-1">{label}</span><ArrowRight size={13} className="text-muted-foreground" /></button>)}</div>}
     <div className="grid grid-cols-2 gap-2.5 xl:grid-cols-4">
-      <Metric label="Total products" value="24,820" hint="Across 186 manufacturers" icon={Box} />
-      <Metric label="Verified products" value="23,916" hint="96.4% of product registry" color="text-green" icon={ShieldCheck} />
-      <Metric label="High-risk products" value="127" hint="Require enhanced review" color="text-amber" icon={AlertTriangle} />
-      <Metric label="Clones detected" value="84" hint="+12 in the last 7 days" color="text-red" icon={Fingerprint} />
+      <Metric label="Total products" value="24,820" hint="Sample demo figure" icon={Box} />
+      <Metric label="Verified products" value="23,916" hint="Sample demo figure" color="text-green" icon={ShieldCheck} />
+      <Metric label="High-risk products" value="127" hint="Sample demo figure" color="text-amber" icon={AlertTriangle} />
+      <Metric label="Clones detected" value="84" hint="Sample demo figure" color="text-red" icon={Fingerprint} />
     </div>
     <div className="mt-3 grid gap-3 xl:grid-cols-[1.6fr_1fr]">
       <Panel>
@@ -302,6 +433,12 @@ function QuickVerify({ onVerify }: { onVerify: (id?: string) => void }) {
 
 function VerifyScreen({ productId, setProductId, result, step, runVerification, onScanner, fileInput, fileName, setFileName, notice, setNotice, onRisk }: { productId: string; setProductId: (id: string) => void; result: Result | null; step: number; runVerification: (id?: string) => void; onScanner: () => void; fileInput: React.RefObject<HTMLInputElement | null>; fileName: string; setFileName: (name: string) => void; notice: string; setNotice: (value: string) => void; onRisk: () => void }) {
   const product = result?.status !== "NOT FOUND" && result ? getProduct(result.id) : null;
+  // QR hash source (Phase 7B.2): prefer the canonical metadata hash captured
+  // from this run's live verification response. When none is available (""),
+  // the QR dialog refuses to fabricate a seal instead of presenting the
+  // display product's (potentially noncanonical) stored hash as canonical.
+  const qrMetadataHash = result?.metadataHash ?? product?.metadataHash ?? "";
+  const [qrOpen, setQrOpen] = useState(false);
   const status = result?.status ?? null;
   const resultColor = status === "AUTHENTIC" ? "text-green" : status === "SUSPICIOUS" ? "text-amber" : status ? "text-red" : "text-foreground";
   const checking = step >= 0 && step < 5;
@@ -311,10 +448,9 @@ function VerifyScreen({ productId, setProductId, result, step, runVerification, 
     SUSPICIOUS: ["Product identity exists on the ledger", "Blockchain record is valid", "Unusual location change detected", "Multiple recent scans detected", "Enhanced verification is recommended"],
     "CLONE SUSPECTED": ["Duplicate product identity detected", "Impossible geographic movement flagged", "Unusual scan frequency observed", "Supply-chain record does not match", "Treat this item as potentially counterfeit"],
   };
-  const productFields = product ? [{ label: "Product ID", value: product.id }, { label: "Manufacturer", value: product.manufacturer }, { label: "Batch", value: product.batch }, { label: "Manufactured", value: product.manufactured }, { label: "Blockchain", value: "Identity confirmed" }, { label: "Last verified", value: "Just now" }] : [];
 
   return <>
-    <SectionHead eyebrow="Console 02 · Product identity" title="Is your product genuine?" description="Check its signed digital identity, supply-chain record, and scan behavior." action={<div className="flex items-center gap-1.5 rounded border border-green/25 bg-green/5 px-2.5 py-2 font-mono text-[9px] text-green"><ShieldCheck size={13} /> Network connected</div>} />
+    <SectionHead eyebrow="Console 02 · Product identity" title="Is your product genuine?" description="Check its signed digital identity, supply-chain record, and scan behavior." action={<ChainStatusBadge />} />
     <div className="grid items-start gap-3 xl:grid-cols-[0.9fr_1.1fr]">
       <Panel>
         <div className="mb-3 flex items-center justify-between"><div><h2 className="text-sm font-semibold">Scan or enter product ID</h2><p className="mt-1 text-[10px] text-muted-foreground">Start from a QR seal, ID, or purchase evidence.</p></div><span className="rounded border border-cyan/25 bg-cyan/5 px-2 py-1 font-mono text-[8px] text-cyan">RISK-ADAPTIVE</span></div>
@@ -324,12 +460,12 @@ function VerifyScreen({ productId, setProductId, result, step, runVerification, 
           <div className="absolute inset-x-0 top-1/2 h-px bg-cyan/60 shadow-[0_0_14px_var(--cyan)] instrument-scan" />
           <div className="absolute bottom-2 flex items-center gap-1.5 font-mono text-[8px] text-cyan"><span className="instrument-pulse size-1.5 rounded-full bg-cyan" />READY TO READ SEAL</div>
         </div>
-        <Button variant="outline" onClick={onScanner} className="mb-4 h-9 w-full border-line bg-background text-xs"><Fingerprint size={15} /> Open QR scanner <span className="ml-auto text-[9px] text-muted-foreground">SIMULATED</span></Button>
+        <Button variant="outline" onClick={onScanner} className="mb-4 h-9 w-full border-line bg-background text-xs"><Fingerprint size={15} /> Open QR scanner <span className="ml-auto text-[9px] text-muted-foreground">CAMERA · MANUAL</span></Button>
         <div className="mb-2 flex items-center gap-2"><span className="h-px flex-1 bg-line" /><span className="font-mono text-[8px] uppercase text-muted-foreground">or enter identity</span><span className="h-px flex-1 bg-line" /></div>
         <label htmlFor="product-id" className="mb-1.5 block font-mono text-[9px] uppercase text-muted-foreground">Product ID</label>
         <form onSubmit={(event) => { event.preventDefault(); runVerification(productId); }} className="flex gap-2"><Input id="product-id" value={productId} onChange={(event) => { setProductId(event.target.value); setNotice(""); }} placeholder="VC-NIKE-001" className="h-10 border-line bg-background font-mono text-xs" /><Button className="h-10 shrink-0 px-3 text-xs"><Fingerprint size={14} /> Verify</Button></form>
         {notice && <p role="alert" className="mt-2 text-[10px] text-amber">{notice}</p>}
-        <div className="mt-2 flex flex-wrap gap-1.5">{products.map((item) => <button key={item.id} type="button" onClick={() => { setProductId(item.id); setNotice(""); }} className="rounded border border-line px-2 py-1 font-mono text-[8px] text-muted-foreground hover:border-cyan/40 hover:text-cyan">{item.id}</button>)}</div>
+        <div className="mt-2 flex flex-wrap gap-1.5">{products.map((item) => <button key={item.id} type="button" disabled={checking} onClick={() => runVerification(item.id)} className="rounded border border-line px-2 py-1 font-mono text-[8px] text-muted-foreground enabled:hover:border-cyan/40 enabled:hover:text-cyan disabled:opacity-50">{item.id}</button>)}</div>
         <div className="mt-4 border-t border-line pt-3"><input ref={fileInput} type="file" accept="image/*,.pdf" className="sr-only" onChange={(event) => { const file = event.target.files?.[0]; if (file) setFileName(file.name); }} /><Button variant="outline" onClick={() => fileInput.current?.click()} className="h-8 w-full border-line bg-background text-[10px]"><Upload size={14} /> {fileName ? "Evidence attached" : "Upload verification evidence"}</Button>{fileName && <div className="mt-2 flex items-center gap-1.5 truncate font-mono text-[9px] text-green"><FileCheck2 size={12} />{fileName}</div>}</div>
       </Panel>
       <div className="space-y-3">
@@ -383,17 +519,22 @@ function VerifyScreen({ productId, setProductId, result, step, runVerification, 
               {/* Panel 2: Product Identity & Registry */}
               {product && (
                 <div className="rounded-md border border-line bg-panel p-4">
-                  <div className="mb-2 flex items-center gap-2">
-                    <Database size={13} className="text-cyan" />
-                    <span className="font-mono text-[9px] uppercase text-cyan">Identity &amp; Registry</span>
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <Database size={13} className="text-cyan" />
+                      <span className="font-mono text-[9px] uppercase text-cyan">Identity &amp; Registry</span>
+                    </div>
+                    <Button variant="outline" onClick={() => setQrOpen(true)} aria-label={`Show QR seal for ${product.id}`} className="h-7 border-line bg-background px-2 text-[9px]">
+                      <Blocks size={12} /> Show QR
+                    </Button>
                   </div>
                   <div className="grid grid-cols-2 gap-x-3 gap-y-2 sm:grid-cols-3">
                     {[
                       { label: "Product ID", value: product.id },
                       { label: "Manufacturer", value: product.manufacturer },
-                      { label: "Batch", value: product.batch },
-                      { label: "Manufactured", value: product.manufactured },
-                      { label: "Serial", value: product.serial ?? "—" },
+                      { label: "Batch", value: product.batchId },
+                      { label: "Manufactured", value: product.manufacturedDisplay },
+                      { label: "Serial", value: product.serialNumber ?? "—" },
                     ].map(({ label, value }) => (
                       <div key={label}>
                         <div className="font-mono text-[8px] uppercase text-muted-foreground">{label}</div>
@@ -542,6 +683,7 @@ function VerifyScreen({ productId, setProductId, result, step, runVerification, 
         })()}
 
       </div>
+      {qrOpen && product && <ProductQrDialog product={product} metadataHash={qrMetadataHash} onClose={() => setQrOpen(false)} />}
     </div>
 
     <div className="mt-3 grid gap-2 sm:grid-cols-3">{[{ title: "LEVEL 1 · Basic", desc: "Product ID · blockchain record · metadata hash", active: !result || result.score < 30 }, { title: "LEVEL 2 · Enhanced", desc: "Scan history · location signals · purchase evidence", active: !!result && result.score >= 30 && result.score < 70 }, { title: "LEVEL 3 · Advanced", desc: "Provenance · behavior · image and identity evidence", active: !!result && result.score >= 70 }].map((level) => <div key={level.title} className={`rounded-md border px-3 py-2.5 ${level.active ? "border-cyan/30 bg-cyan/5" : "border-line bg-panel/70"}`}><div className={`font-mono text-[9px] ${level.active ? "text-cyan" : "text-muted-foreground"}`}>{level.title}{level.active ? " · SELECTED" : ""}</div><p className="mt-1 text-[9px] leading-relaxed text-muted-foreground">{level.desc}</p></div>)}</div>
@@ -549,40 +691,40 @@ function VerifyScreen({ productId, setProductId, result, step, runVerification, 
 }
 
 function Registry({ search, setSearch, filter, setFilter, pageNumber, setPageNumber, onOpen }: { search: string; setSearch: (value: string) => void; filter: string; setFilter: (value: string) => void; pageNumber: number; setPageNumber: (value: number) => void; onOpen: (id?: string) => void }) {
-  const filtered = useMemo(() => getProducts().filter((product) => (filter === "All" || product.status === filter) && `${product.name} ${product.id} ${product.manufacturer} ${product.batch}`.toLowerCase().includes(search.toLowerCase())), [filter, search]);
+  const filtered = useMemo(() => getProducts().filter((product) => (filter === "All" || product.status === filter) && `${product.name} ${product.id} ${product.manufacturer} ${product.batchId}`.toLowerCase().includes(search.toLowerCase())), [filter, search]);
   return <><SectionHead eyebrow="Console 03 · Registry" title="Product registry" description="Review registered product identities, manufacturer records, and their current verification status." action={<Button variant="outline" onClick={() => onOpen("VC-NIKE-001")} className="h-9 border-line bg-panel text-xs"><Fingerprint size={14} /> Verify product</Button>} />
     <Panel className="p-3"><div className="mb-3 flex flex-wrap items-center gap-2"><div className="relative min-w-[200px] flex-1"><Search className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" size={14} /><Input aria-label="Search registry" placeholder="Search product, ID, maker or batch…" value={search} onChange={(event) => { setSearch(event.target.value); setPageNumber(1); }} className="h-9 border-line bg-background pl-9 text-xs" /></div><div className="flex items-center gap-1.5"><ListFilter size={14} className="text-muted-foreground" />{["All", "AUTHENTIC", "SUSPICIOUS", "CLONE SUSPECTED"].map((item) => <Button key={item} variant={filter === item ? "secondary" : "ghost"} onClick={() => { setFilter(item); setPageNumber(1); }} className={`h-8 px-2 text-[9px] ${filter === item ? "text-cyan" : "text-muted-foreground"}`}>{item === "CLONE SUSPECTED" ? "CLONE" : item === "AUTHENTIC" ? "VERIFIED" : item === "SUSPICIOUS" ? "REVIEW" : item}</Button>)}</div></div>
       <div className="hidden grid-cols-[1.5fr_1fr_0.75fr_0.75fr_0.5fr] gap-2 border-y border-line py-2 font-mono text-[8px] uppercase text-muted-foreground md:grid"><span>Product / ID</span><span>Manufacturer</span><span>Batch</span><span>Status / risk</span><span /></div>
-      <div className="divide-y divide-line">{filtered.map((product) => { const score = calculateRisk(product); return <div key={product.id} className="grid gap-2 py-3 md:grid-cols-[1.5fr_1fr_0.75fr_0.75fr_0.5fr] md:items-center"><div className="min-w-0"><div className="truncate text-[11px] font-medium">{product.name}</div><div className="mt-1 font-mono text-[9px] text-muted-foreground">{product.id} · {product.serial}</div></div><div className="text-[10px] text-muted-foreground">{product.manufacturer}</div><div className="font-mono text-[9px] text-muted-foreground">{product.batch}</div><div className="flex items-center gap-1.5"><StatusBadge status={product.status} /><span className={`font-mono text-[9px] ${score >= 60 ? "text-red" : score >= 30 ? "text-amber" : "text-green"}`}>{score}</span></div><div className="flex justify-end"><Button onClick={() => onOpen(product.id)} variant="ghost" className="h-7 px-2 text-[9px] text-cyan">View <ArrowRight size={12} /></Button></div></div>; })}{filtered.length === 0 && <div className="py-10 text-center text-xs text-muted-foreground">No products match those filters.</div>}</div>
+      <div className="divide-y divide-line">{filtered.map((product) => { const score = calculateRisk(product); return <div key={product.id} className="grid gap-2 py-3 md:grid-cols-[1.5fr_1fr_0.75fr_0.75fr_0.5fr] md:items-center"><div className="min-w-0"><div className="truncate text-[11px] font-medium">{product.name}</div><div className="mt-1 font-mono text-[9px] text-muted-foreground">{product.id} · {product.serialNumber}</div></div><div className="text-[10px] text-muted-foreground">{product.manufacturer}</div><div className="font-mono text-[9px] text-muted-foreground">{product.batchId}</div><div className="flex items-center gap-1.5"><StatusBadge status={product.status} /><span className={`font-mono text-[9px] ${score >= 60 ? "text-red" : score >= 30 ? "text-amber" : "text-green"}`}>{score}</span></div><div className="flex justify-end"><Button onClick={() => onOpen(product.id)} variant="ghost" className="h-7 px-2 text-[9px] text-cyan">View <ArrowRight size={12} /></Button></div></div>; })}{filtered.length === 0 && <div className="py-10 text-center text-xs text-muted-foreground">No products match those filters.</div>}</div>
       <div className="flex items-center justify-between border-t border-line pt-3"><span className="text-[9px] text-muted-foreground">Showing {filtered.length} sample identities from the live demo registry</span><div className="flex gap-1"><Button variant="outline" disabled={pageNumber === 1} onClick={() => setPageNumber(Math.max(1, pageNumber - 1))} className="h-7 border-line bg-background px-2 text-[9px]">Previous</Button><span className="grid min-w-7 place-items-center font-mono text-[9px] text-cyan">{pageNumber}</span><Button variant="outline" onClick={() => setPageNumber(pageNumber + 1)} className="h-7 border-line bg-background px-2 text-[9px]">Next</Button></div></div>
     </Panel></>;
 }
 
 function SupplyChain({ selectedNode, setSelectedNode, onVerify }: { selectedNode: number; setSelectedNode: (index: number) => void; onVerify: (id?: string) => void }) {
-  const product = products[0];
+  const product = products[0]!;
   const nodes = [
     { title: "Manufacturer", name: "Nike Manufacturing", place: "Beaverton, Oregon", date: "05 Sep 2026 · 08:14", tx: "0x7a91…e82c", detail: "Product identity sealed; origin and materials attested." },
     { title: "Distribution", name: "West Coast Distribution", place: "Oakland, California", date: "08 Sep 2026 · 16:32", tx: "0x23d8…901b", detail: "Custody transferred to the authorized regional hub." },
     { title: "Retail partner", name: "Union Street Sports", place: "San Francisco, California", date: "12 Sep 2026 · 10:06", tx: "0x99a2…10df", detail: "Authorized retailer received and checked the sealed batch." },
     { title: "Verified buyer", name: "Ownership handoff", place: "Portland, Oregon", date: "18 Sep 2026 · 13:42", tx: "0x61ce…13ae", detail: "Product identity checked at the time of purchase." },
   ];
-  const current = nodes[selectedNode] ?? nodes[0];
+  const current = nodes[selectedNode] ?? nodes[0]!;
   return <><SectionHead eyebrow="Console 04 · Provenance" title="Supply chain" description="A readable custody trail shows who handled a product and where each handoff happened." action={<Button onClick={() => onVerify(product.id)} className="h-9 text-xs"><Fingerprint size={14} /> Verify identity</Button>} />
-    <Panel><PanelHeading title={product.name} detail={`${product.id} · Batch ${product.batch} · Manufacturer signed`} action={<StatusBadge status="AUTHENTIC" />} />
+    <Panel><PanelHeading title={product.name} detail={`${product.id} · Batch ${product.batchId} · Manufacturer signed`} action={<StatusBadge status="AUTHENTIC" />} />
       <div className="mt-5 grid grid-cols-2 gap-y-5 sm:grid-cols-4">{nodes.map((node, index) => <button key={node.title} onClick={() => setSelectedNode(index)} className="group relative flex flex-col items-center px-2 text-center"><span className={`absolute left-1/2 top-4 hidden h-px w-full -translate-y-1/2 sm:block ${index < nodes.length - 1 ? "bg-line" : "bg-transparent"}`} /><span className={`relative z-10 grid size-9 place-items-center rounded-full border transition-colors ${selectedNode === index ? "border-cyan bg-cyan/15 text-cyan" : index < selectedNode ? "border-green/30 bg-green/10 text-green" : "border-line bg-background text-muted-foreground"}`}>{index === 0 ? <PackageCheck size={16} /> : index === 1 ? <Blocks size={16} /> : index === 2 ? <Box size={16} /> : <ShieldCheck size={16} />}</span><span className={`mt-2 text-[10px] font-semibold ${selectedNode === index ? "text-cyan" : "text-foreground"}`}>{node.title}</span><span className="mt-1 text-[9px] text-muted-foreground">{node.name}</span><span className="mt-1 font-mono text-[8px] text-muted-foreground">{node.date.split(" · ")[0]}</span></button>)}</div>
     </Panel>
-    <div className="mt-3 grid gap-3 xl:grid-cols-[1.15fr_0.85fr]"><Panel><PanelHeading title={current.title} detail={current.name} /><div className="space-y-3">{[{ label: "Location", value: current.place, icon: MapPin }, { label: "Timestamp", value: current.date, icon: Clock3 }, { label: "Blockchain transaction", value: current.tx, icon: Blocks }, { label: "Confirmation", value: "Confirmed · Block 18,429,703", icon: BadgeCheck }].map(({ label, value, icon: Icon }) => <div key={label} className="flex items-start gap-2.5 border-b border-line/60 pb-2.5 last:border-0"><Icon size={14} className="mt-0.5 text-cyan" /><div><div className="font-mono text-[8px] uppercase text-muted-foreground">{label}</div><div className="mt-1 text-[10px]">{value}</div></div></div>)}</div><p className="mt-2 border-l border-cyan/40 pl-3 text-[10px] leading-relaxed text-muted-foreground">{current.detail}</p><Button variant="outline" onClick={() => navigator.clipboard?.writeText(current.tx)} className="mt-3 h-8 border-line bg-background text-[9px]"><ExternalLink size={13} /> Copy transaction reference</Button></Panel>
+    <div className="mt-3 grid gap-3 xl:grid-cols-[1.15fr_0.85fr]"><Panel><PanelHeading title={current.title} detail={current.name} /><div className="space-y-3">{[{ label: "Location", value: current.place, icon: MapPin }, { label: "Timestamp", value: current.date, icon: Clock3 }, { label: "Provenance reference (demo)", value: current.tx, icon: Blocks }, { label: "Record type", value: "Synthetic demo provenance — not an on-chain transaction", icon: BadgeCheck }].map(({ label, value, icon: Icon }) => <div key={label} className="flex items-start gap-2.5 border-b border-line/60 pb-2.5 last:border-0"><Icon size={14} className="mt-0.5 text-cyan" /><div><div className="font-mono text-[8px] uppercase text-muted-foreground">{label}</div><div className="mt-1 text-[10px]">{value}</div></div></div>)}</div><p className="mt-2 border-l border-cyan/40 pl-3 text-[10px] leading-relaxed text-muted-foreground">{current.detail}</p><Button variant="outline" onClick={() => navigator.clipboard?.writeText(current.tx)} className="mt-3 h-8 border-line bg-background text-[9px]"><ExternalLink size={13} /> Copy provenance reference</Button></Panel>
       <Panel><PanelHeading title="Adaptive verification" detail="Verification depth follows observed risk." /><div className="space-y-2">{[{ title: "LEVEL 1 · Basic", body: "Product ID · blockchain · metadata hash", active: true }, { title: "LEVEL 2 · Enhanced", body: "Location · scan history · purchase evidence", active: false }, { title: "LEVEL 3 · Advanced", body: "Supply chain · behavior · identity evidence", active: false }].map(({ title, body, active }) => <div key={title} className={`rounded border px-3 py-2.5 ${active ? "border-cyan/30 bg-cyan/5" : "border-line bg-background"}`}><div className={`font-mono text-[9px] ${active ? "text-cyan" : "text-muted-foreground"}`}>{title}{active ? " · IN USE" : ""}</div><p className="mt-1 text-[9px] text-muted-foreground">{body}</p></div>)}</div><div className="mt-3 font-mono text-[9px] text-green">✓ Chain of custody consistent</div></Panel></div>
   </>;
 }
 
 function RiskIntelligence({ onOpen }: { onOpen: (id?: string) => void }) {
   return <><SectionHead eyebrow="Console 05 · Threat signals" title="Risk intelligence" description="Spot suspicious scans, geographic anomalies, and identity reuse across the product network." />
-    <div className="grid grid-cols-2 gap-2.5 xl:grid-cols-4"><Metric label="Potential clones" value="84" hint="Across 31 product identities" color="text-red" icon={Fingerprint} /><Metric label="High-risk products" value="127" hint="Score ≥ 60" color="text-amber" icon={AlertTriangle} /><Metric label="Suspicious scans" value="1,284" hint="Last 30 days" color="text-cyan" icon={Activity} /><Metric label="Verification success" value="98.7%" hint="+0.6% vs previous period" color="text-green" icon={ShieldCheck} /></div>
+    <div className="grid grid-cols-2 gap-2.5 xl:grid-cols-4"><Metric label="Potential clones" value="84" hint="Sample demo figure" color="text-red" icon={Fingerprint} /><Metric label="High-risk products" value="127" hint="Sample demo figure" color="text-amber" icon={AlertTriangle} /><Metric label="Suspicious scans" value="1,284" hint="Sample demo figure" color="text-cyan" icon={Activity} /><Metric label="Verification success" value="98.7%" hint="Sample demo figure" color="text-green" icon={ShieldCheck} /></div>
     <div className="mt-3 grid gap-3 xl:grid-cols-2"><Panel><PanelHeading title="Risk signal overview" detail="Relative volume by observed category" />{[{ label: "Unexpected location", width: "82%", amount: "438", color: "bg-red" }, { label: "Duplicate identity scans", width: "66%", amount: "352", color: "bg-amber" }, { label: "Scan frequency", width: "48%", amount: "257", color: "bg-cyan" }, { label: "Supply-chain mismatch", width: "31%", amount: "166", color: "bg-green" }].map((item) => <div key={item.label} className="mb-3 last:mb-0"><div className="mb-1.5 flex justify-between text-[10px]"><span className="text-muted-foreground">{item.label}</span><span className="font-mono">{item.amount}</span></div><div className="h-1.5 overflow-hidden rounded bg-background"><div className={`h-full rounded ${item.color}`} style={{ width: item.width }} /></div></div>)}</Panel>
       <Panel><PanelHeading title="Top suspicious identities" detail="Products with elevated scan anomaly scores" />{products.filter((product) => product.status !== "AUTHENTIC").map((product) => <button key={product.id} onClick={() => onOpen(product.id)} className="flex w-full items-center gap-3 border-b border-line py-3 text-left last:border-0 hover:bg-panel-raised/40"><span className={`grid size-8 place-items-center rounded border ${product.status === "SUSPICIOUS" ? "border-amber/25 bg-amber/10 text-amber" : "border-red/25 bg-red/10 text-red"}`}><ShieldAlert size={15} /></span><span className="min-w-0 flex-1"><span className="block truncate text-[10px] font-medium">{product.name}</span><span className="mt-1 block font-mono text-[9px] text-muted-foreground">{product.id} · {product.recentScans.length} scan anomalies</span></span><span className={`font-mono text-sm ${calculateRisk(product) >= 80 ? "text-red" : "text-amber"}`}>{calculateRisk(product)}</span><ArrowRight size={13} className="text-muted-foreground" /></button>)}</Panel>
     </div>
-    <div className="mt-3 grid gap-3 xl:grid-cols-2"><RiskFactorsPanel product={products[3]} /><AdaptiveLevels selected={2} /></div>
+    <div className="mt-3 grid gap-3 xl:grid-cols-2"><RiskFactorsPanel product={products[3]!} /><AdaptiveLevels selected={2} /></div>
   </>;
 }
 
@@ -614,12 +756,18 @@ function Alerts({ onOpen }: { onOpen: (id?: string) => void }) {
 }
 
 function Analytics({ period, setPeriod, selectedTransaction, setSelectedTransaction }: { period: "7 days" | "30 days"; setPeriod: (period: "7 days" | "30 days") => void; selectedTransaction: string | null; setSelectedTransaction: (hash: string | null) => void }) {
-  const transaction = demoTransactions.find((item) => item.hash === selectedTransaction);
-  return <><SectionHead eyebrow="Monitor · Network records" title="Analytics & blockchain" description="Track identity checks and inspect sample on-chain product registration events." action={<PeriodToggle value={period} onChange={setPeriod} />} />
-    <div className="grid grid-cols-2 gap-2.5 xl:grid-cols-4"><Metric label="Verified checks" value="18,420" hint="This reporting period" color="text-green" icon={ShieldCheck} /><Metric label="Scan anomalies" value="1,284" hint="Flagged for added review" color="text-amber" icon={Activity} /><Metric label="Clone detections" value="84" hint="Across 31 identities" color="text-red" icon={Fingerprint} /><Metric label="Network records" value="18,429,703" hint="Latest confirmed block" color="text-cyan" icon={Blocks} /></div>
+  const network = useNetworkStatus();
+  const ledger = useLedgerTransactions();
+  const transactions = ledger.data ?? [];
+  const transaction = transactions.find((item) => item.hash === selectedTransaction);
+  const live = chainIsLive(network.data);
+  const blockValue = network.data?.blockNumber != null ? network.data.blockNumber.toLocaleString("en-US") : "Unavailable";
+  const blockHint = network.data?.blockNumber != null ? `Latest ${network.data.networkName} block` : "Ledger unavailable";
+  return <><SectionHead eyebrow="Monitor · Network records" title="Analytics & blockchain" description="Track identity checks and inspect the on-chain registration events this backend has actually recorded." action={<PeriodToggle value={period} onChange={setPeriod} />} />
+    <div className="grid grid-cols-2 gap-2.5 xl:grid-cols-4"><Metric label="Verified checks" value="18,420" hint="Sample demo figure" color="text-green" icon={ShieldCheck} /><Metric label="Scan anomalies" value="1,284" hint="Sample demo figure" color="text-amber" icon={Activity} /><Metric label="Clone detections" value="84" hint="Sample demo figure" color="text-red" icon={Fingerprint} /><Metric label="Network block" value={blockValue} hint={blockHint} color="text-cyan" icon={Blocks} /></div>
     <div className="mt-3 grid gap-3 xl:grid-cols-[1.2fr_0.8fr]"><Panel><PanelHeading title="Verification trend" detail={`Daily authentic and flagged checks · ${period}`} /><ActivityChart period={period} /></Panel><Panel><PanelHeading title="Identity outcomes" detail="Share of product scans assessed" />{[{ label: "Authentic", amount: "82%", width: "82%", color: "bg-green" }, { label: "Needs review", amount: "12%", width: "12%", color: "bg-amber" }, { label: "Clone suspected", amount: "6%", width: "6%", color: "bg-red" }].map(({ label, amount, width, color }) => <div key={label} className="mb-4 last:mb-0"><div className="mb-1.5 flex justify-between text-[10px]"><span>{label}</span><span className="font-mono text-muted-foreground">{amount}</span></div><div className="h-2 overflow-hidden rounded bg-background"><div className={`h-full rounded ${color}`} style={{ width }} /></div></div>)}</Panel></div>
-    <Panel className="mt-3 p-0"><div className="flex items-center justify-between border-b border-line px-4 py-3"><div><h2 className="text-sm font-semibold">Recent ledger events</h2><p className="mt-1 text-[9px] text-muted-foreground">Select any record to inspect details</p></div><span className="flex items-center gap-1.5 font-mono text-[9px] text-green"><span className="instrument-pulse size-1.5 rounded-full bg-green" />SYNCED</span></div><div className="divide-y divide-line">{demoTransactions.map((item) => <button key={item.hash} onClick={() => setSelectedTransaction(item.hash)} className="grid w-full grid-cols-[0.65fr_1fr_1fr_0.6fr] items-center gap-2 px-4 py-3 text-left hover:bg-panel-raised/50"><span className="font-mono text-[9px] text-muted-foreground">#{item.block}</span><span className="truncate font-mono text-[9px] text-cyan">{item.hash}</span><span className="truncate text-[9px]">{item.event}</span><span className="font-mono text-[8px] text-green">{item.status}</span></button>)}</div></Panel>
-    {transaction && <Modal title="Ledger transaction" onClose={() => setSelectedTransaction(null)}><div className="space-y-3">{[{ label: "Transaction hash", value: transaction.hash }, { label: "Block number", value: transaction.block }, { label: "Timestamp", value: transaction.timestamp }, { label: "Event", value: transaction.event }, { label: "Product ID", value: transaction.productId }, { label: "Status", value: transaction.status }, { label: "Metadata", value: "SHA-256 identity signature confirmed" }].map(({ label, value }) => <div key={label} className="flex items-start justify-between gap-3 border-b border-line pb-2"><span className="font-mono text-[9px] text-muted-foreground">{label}</span><span className="break-all text-right text-[10px]">{value}</span></div>)}</div></Modal>}
+    <Panel className="mt-3 p-0"><div className="flex items-center justify-between border-b border-line px-4 py-3"><div><h2 className="text-sm font-semibold">Recent ledger events</h2><p className="mt-1 text-[9px] text-muted-foreground">Recorded by the backend — nothing is synthesised</p></div><span className={`flex items-center gap-1.5 font-mono text-[9px] ${live ? "text-green" : "text-amber"}`}><span className={`size-1.5 rounded-full ${live ? "instrument-pulse bg-green" : "bg-amber"}`} />{live ? "SYNCED" : "UNAVAILABLE"}</span></div><div className="divide-y divide-line">{transactions.map((item) => <button key={item.hash} onClick={() => setSelectedTransaction(item.hash)} className="grid w-full grid-cols-[0.65fr_1fr_1fr_0.6fr] items-center gap-2 px-4 py-3 text-left hover:bg-panel-raised/50"><span className="font-mono text-[9px] text-muted-foreground">#{item.blockNumber}</span><span className="truncate font-mono text-[9px] text-cyan">{item.hash}</span><span className="truncate text-[9px]">{item.event}</span><span className={`font-mono text-[8px] ${item.status === "CONFIRMED" ? "text-green" : item.status === "FAILED" ? "text-red" : "text-amber"}`}>{item.status}</span></button>)}{transactions.length === 0 && <div className="px-4 py-8 text-center text-[10px] text-muted-foreground">{ledger.loading ? "Reading the ledger…" : ledger.error ? `Ledger unavailable: ${ledger.error}` : "No blockchain transactions have been recorded yet."}</div>}</div></Panel>
+    {transaction && <Modal title="Ledger transaction" onClose={() => setSelectedTransaction(null)}><div className="space-y-3">{[{ label: "Transaction hash", value: transaction.hash }, { label: "Block number", value: transaction.blockNumber }, { label: "Timestamp", value: transaction.timestamp }, { label: "Event", value: transaction.event }, { label: "Product ID", value: transaction.productId }, { label: "Status", value: transaction.status }, { label: "Contract", value: transaction.contractAddress ?? "Unavailable" }, { label: "Network", value: transaction.network ?? "Unavailable" }, { label: "Metadata hash", value: transaction.metadataHash ?? "Unavailable" }].map(({ label, value }) => <div key={label} className="flex items-start justify-between gap-3 border-b border-line pb-2"><span className="font-mono text-[9px] text-muted-foreground">{label}</span><span className="break-all text-right text-[10px]">{value}</span></div>)}</div></Modal>}
   </>;
 }
 
@@ -638,12 +786,12 @@ function Admin({ registrationStep, setRegistrationStep, registered, setRegistere
   };
   return <><SectionHead eyebrow="System · Identity enrollment" title="Register a product" description="Create a demonstration product identity and walk through its provenance enrollment steps." />
     <Panel className="mx-auto max-w-3xl"><div className="mb-5 flex items-center justify-between gap-1 overflow-x-auto">{steps.map((label, index) => <div key={label} className="flex min-w-[60px] flex-1 flex-col items-center gap-1.5"><div className={`grid size-7 place-items-center rounded-full border font-mono text-[9px] ${registrationStep === index ? "border-cyan bg-cyan/10 text-cyan" : registrationStep > index || registered ? "border-green/30 bg-green/10 text-green" : "border-line text-muted-foreground"}`}>{registrationStep > index || registered ? "✓" : index + 1}</div><span className={`text-center text-[8px] ${registrationStep === index ? "text-cyan" : "text-muted-foreground"}`}>{label}</span></div>)}</div>
-      {registered ? <div className="py-6 text-center"><div className="mx-auto grid size-12 place-items-center rounded-full border border-green/30 bg-green/10 text-green"><ShieldCheck size={24} /></div><h2 className="mt-3 font-display text-lg font-semibold text-green">Product registered successfully</h2><p className="mt-2 text-xs text-muted-foreground">{name} · {manufacturer} · {batch || "New batch"}</p><div className="mx-auto mt-4 max-w-sm rounded border border-line bg-background p-3 text-left"><div className="font-mono text-[8px] uppercase text-muted-foreground">Generated product ID</div><div className="mt-1 font-mono text-xs text-cyan">VC-DEMO-005</div><div className="mt-3 font-mono text-[8px] uppercase text-muted-foreground">Blockchain transaction</div><div className="mt-1 font-mono text-[10px]">0x82ab…f912</div></div><Button onClick={() => { setRegistered(false); setRegistrationStep(0); setName(""); setManufacturer(""); setBatch(""); }} className="mt-4"><Plus size={14} /> Register another</Button></div> : <>
+      {registered ? <div className="py-6 text-center"><div className="mx-auto grid size-12 place-items-center rounded-full border border-green/30 bg-green/10 text-green"><ShieldCheck size={24} /></div><h2 className="mt-3 font-display text-lg font-semibold text-green">Product registered successfully</h2><p className="mt-2 text-xs text-muted-foreground">{name} · {manufacturer} · {batch || "New batch"}</p><div className="mx-auto mt-4 max-w-sm rounded border border-line bg-background p-3 text-left"><div className="font-mono text-[8px] uppercase text-muted-foreground">Generated product ID</div><div className="mt-1 font-mono text-xs text-cyan">VC-DEMO-005</div><div className="mt-3 font-mono text-[8px] uppercase text-muted-foreground">On-chain registration</div><div className="mt-1 font-mono text-[10px]">Not submitted — demo preview</div></div><Button onClick={() => { setRegistered(false); setRegistrationStep(0); setName(""); setManufacturer(""); setBatch(""); }} className="mt-4"><Plus size={14} /> Register another</Button></div> : <>
         {registrationStep === 0 && <FormField label="Product name" value={name} onChange={setName} placeholder="e.g. Air Max 2026" />}
         {registrationStep === 1 && <FormField label="Manufacturer" value={manufacturer} onChange={setManufacturer} placeholder="e.g. Nike" />}
         {registrationStep === 2 && <><FormField label="Batch number" value={batch} onChange={setBatch} placeholder="e.g. B2026-091" /><div className="mt-3 rounded border border-line bg-background p-3 text-[10px] text-muted-foreground">A verification-ready metadata record will be prepared from the details provided.</div></>}
         {registrationStep === 3 && <div className="rounded border border-cyan/25 bg-cyan/5 p-4"><div className="flex items-center gap-2 text-xs text-cyan"><Fingerprint size={15} />Identity generated</div><div className="mt-2 font-mono text-sm">VC-DEMO-005</div><div className="mt-1 text-[9px] text-muted-foreground">A unique product ID is ready for the demo ledger.</div></div>}
-        {registrationStep === 4 && <div className="rounded border border-green/25 bg-green/5 p-4"><div className="flex items-center gap-2 text-xs text-green"><Blocks size={15} />Registration transaction confirmed</div><div className="mt-2 font-mono text-[10px]">0x82ab…f912 · Block 18,429,703</div></div>}
+        {registrationStep === 4 && <div className="rounded border border-green/25 bg-green/5 p-4"><div className="flex items-center gap-2 text-xs text-green"><Blocks size={15} />Registration preview only</div><div className="mt-2 font-mono text-[10px]">No transaction is sent during this demo walkthrough.</div></div>}
         {registrationStep === 5 && <div className="mx-auto grid max-w-sm justify-items-center rounded border border-line bg-background p-5"><div className="grid size-28 grid-cols-7 gap-1" aria-label="Product QR code">{Array.from({ length: 49 }, (_, i) => <span key={i} className={`rounded-[1px] ${[0,1,2,5,7,9,10,12,14,17,18,20,21,24,25,27,28,31,32,34,36,38,40,41,42,45,47,48].includes(i) ? "bg-cyan" : "bg-panel-raised"}`} />)}</div><span className="mt-3 font-mono text-[10px]">VC-DEMO-005</span></div>}
         {error && <p role="alert" className="mt-3 text-[10px] text-amber">{error}</p>}
         <div className="mt-5 flex justify-between border-t border-line pt-4">{registrationStep > 0 ? <Button variant="outline" onClick={() => { setError(""); setRegistrationStep(registrationStep - 1); }} className="border-line bg-background text-xs">Back</Button> : <span />}<Button onClick={advance} className="text-xs">{registrationStep === 5 ? "Generate QR code" : registrationStep === 4 ? "Continue to QR code" : "Continue"} <ArrowRight size={13} /></Button></div>
@@ -659,4 +807,208 @@ function FormField({ label, value, onChange, placeholder }: { label: string; val
 function Modal({ title, children, onClose }: { title: string; children: React.ReactNode; onClose: () => void }) {
   useEffect(() => { const onKeyDown = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); }; window.addEventListener("keydown", onKeyDown); return () => window.removeEventListener("keydown", onKeyDown); }, [onClose]);
   return <div role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }} className="fixed inset-0 z-[60] flex items-center justify-center bg-background/75 p-4 backdrop-blur-sm"><section role="dialog" aria-modal="true" aria-label={title} className="max-h-[90vh] w-full max-w-lg overflow-auto rounded-md border border-line bg-panel p-4 shadow-2xl"><div className="mb-4 flex items-center justify-between border-b border-line pb-3"><h2 className="text-sm font-semibold">{title}</h2><Button variant="ghost" onClick={onClose} aria-label="Close dialog" size="icon" className="h-8 w-8 text-muted-foreground"><X size={15} /></Button></div>{children}</section></div>;
+}
+
+/**
+ * Phase 6.2 — QR generation (display only, no scanning).
+ * Shows the Phase 6.1 payload for a product as a scannable QR image.
+ * The QR is an input channel for future scans; displaying it is NOT proof of
+ * authenticity. Authenticity is only ever decided by the verification pipeline.
+ */
+function ProductQrDialog({ product, metadataHash = product.metadataHash, onClose }: { product: Product; metadataHash?: string; onClose: () => void }) {
+  const [svg, setSvg] = useState<string | null>(null);
+  const [payload, setPayload] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    try {
+      const encoded = encodeQrPayload(product.id, metadataHash);
+      QRCode.toString(encoded, { type: "svg", margin: 1, width: 180, errorCorrectionLevel: "M" })
+        .then((svgString) => {
+          if (cancelled) return;
+          setSvg(svgString);
+          setPayload(encoded);
+        })
+        .catch(() => {
+          if (!cancelled) setError("The QR image could not be generated for this product.");
+        });
+    } catch {
+      // encodeQrPayload rejected (missing/malformed metadata hash or bad ID):
+      // show a clear message instead of a fabricated or empty seal.
+      if (!cancelled) setError("No digital seal is available for this product — its metadata hash is missing or malformed.");
+    }
+    return () => { cancelled = true; };
+  }, [product.id, metadataHash]);
+
+  return <Modal title="Product seal" onClose={onClose}>
+    {error ? (
+      <p role="alert" className="rounded border border-amber/25 bg-amber/5 px-3 py-2 text-[10px] text-amber">{error}</p>
+    ) : svg && payload ? (
+      <div className="flex flex-col items-center gap-3">
+        <div className="rounded-md border border-line bg-background p-3" dangerouslySetInnerHTML={{ __html: svg }} />
+        <div className="w-full text-center">
+          <div className="font-mono text-[10px] font-semibold text-foreground">{product.id}</div>
+          <div className="text-[9px] text-muted-foreground">{product.name}</div>
+        </div>
+        <div className="w-full rounded border border-line bg-background px-2.5 py-2">
+          <div className="font-mono text-[8px] uppercase text-muted-foreground">Seal payload</div>
+          <p className="mt-1 break-all font-mono text-[9px] text-muted-foreground" aria-label="QR payload">{payload}</p>
+        </div>
+        <p className="text-center text-[9px] text-muted-foreground leading-relaxed">
+          This code only starts a verification — it never proves authenticity. Scan results are always confirmed through the live 5-step check.
+        </p>
+      </div>
+    ) : (
+      <div className="py-8 text-center font-mono text-[10px] text-muted-foreground" role="status">GENERATING SEAL…</div>
+    )}
+  </Modal>;
+}
+
+/**
+ * Phase 6.3 — QR scanner (camera where supported, manual fallback always).
+ *
+ * The camera loop only feeds decoded strings through the strict resolver and
+ * then into the ordinary verification starter. It never treats a decode as a
+ * verification result. Camera lifecycle: tracks stop on close, on a
+ * successful decode, and on unmount.
+ */
+type CameraState = "unsupported" | "starting" | "scanning" | "denied" | "unavailable";
+
+function QrScannerModal({ onClose, onScanned }: { onClose: () => void; onScanned: (scan: ScanResolution) => void }) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  // Keep the latest callbacks in refs so the camera effect can run once per
+  // mount with stable dependencies: fresh parent closures re-rendering the
+  // Dashboard must not tear down and restart (re-request) the camera.
+  const onScannedRef = useRef(onScanned);
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onScannedRef.current = onScanned;
+    onCloseRef.current = onClose;
+  });
+  const [cameraState, setCameraState] = useState<CameraState>("starting");
+  const [message, setMessage] = useState<string | null>(null);
+  const [manual, setManual] = useState("");
+  // One verification per open session, even across many camera frames.
+  const guardRef = useRef<() => boolean>(createDecodeGuard());
+
+  useEffect(() => {
+    let stream: MediaStream | null = null;
+    let timer: number | null = null;
+    let cancelled = false;
+
+    const Detector = getBarcodeDetectorCtor();
+    if (!Detector) {
+      setCameraState("unsupported"); // graceful fallback: manual input below
+      return () => {};
+    }
+    // Insecure contexts (plain http) and some browsers expose no mediaDevices.
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setCameraState("unsupported");
+      return () => {};
+    }
+
+    const finish = () => {
+      stopCameraStream(stream);
+      stream = null;
+    };
+
+    void (async () => {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "environment" },
+        });
+        if (cancelled) { finish(); return; }
+        const video = videoRef.current;
+        // The <video> element is mounted for the whole "starting" and
+        // "scanning" window (see JSX below), so this can only be null after an
+        // unexpected unmount — stop the stream, never leave it running.
+        if (!video) { finish(); return; }
+        video.srcObject = stream;
+        await video.play().catch(() => undefined);
+        if (cancelled) { finish(); return; }
+        setCameraState("scanning");
+        const detector = new Detector({ formats: ["qr_code"] });
+        timer = window.setInterval(() => {
+          const current = videoRef.current;
+          if (!current || current.readyState < 2) return;
+          void (async () => {
+            try {
+              const codes = await detector.detect(current);
+              if (codes.length === 0) return;
+              if (!guardRef.current()) return; // ignore repeat frames
+              const value = codes[0]?.rawValue;
+              const scan = value ? resolveScannedInput(value) : { ok: false as const, error: "Empty QR payload." };
+              if (!scan.ok) {
+                // Malformed QR: show the reason, re-arm, keep scanning — never verify.
+                setMessage(`QR payload rejected: ${scan.error}`);
+                guardRef.current = createDecodeGuard();
+                return;
+              }
+              finish(); // stop tracks immediately after a successful decode
+              onScannedRef.current(scan);
+              onCloseRef.current();
+            } catch {
+              // Transient detection errors (camera warming up, blur) — keep scanning.
+            }
+          })();
+        }, 400);
+      } catch (err) {
+        const failure = classifyCameraError(err);
+        setCameraState(failure === "denied" ? "denied" : "unavailable");
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearInterval(timer);
+      finish(); // unmount cleanup: stop all camera tracks
+    };
+    // Mount-only: cleanup on close/unmount covers the whole camera lifecycle.
+  }, []);
+
+  const submitManual = (raw: string) => {
+    const scan = resolveScannedInput(raw);
+    if (!scan.ok) {
+      setMessage(`Rejected: ${scan.error}`);
+      return;
+    }
+    stopCameraStream((videoRef.current?.srcObject as MediaStream | null) ?? null);
+    onScannedRef.current(scan);
+    onCloseRef.current();
+  };
+
+  const cameraMessage: Record<CameraState, string> = {
+    unsupported: "Live camera scanning isn't available here (unsupported browser or non-secure context) — paste the seal payload below.",
+    starting: "Starting camera…",
+    scanning: "Point the camera at a VeriChain seal.",
+    denied: "Camera access was denied — paste the seal payload below.",
+    unavailable: "No usable camera was found — paste the seal payload below.",
+  };
+
+  return <Modal title="QR scanner (Phase 6.3)" onClose={onClose}>
+    <div className="mx-auto max-w-sm text-center">
+      {/* Mounted for the whole startup window so the effect finds the element
+          when the camera stream resolves; hidden is only the "unsupported"
+          fallback state, where the manual input takes over. */}
+      {(cameraState === "starting" || cameraState === "scanning") && (
+        <div className="relative mx-auto mb-3 grid h-52 w-full place-items-center overflow-hidden rounded-lg border border-cyan/40 bg-background instrument-grid">
+          <video ref={videoRef} muted playsInline className="size-full object-cover" aria-label="Camera preview" />
+          <div className="pointer-events-none absolute inset-6 border border-cyan/70"><span className="absolute inset-x-0 top-1/3 h-px bg-cyan shadow-[0_0_12px_var(--cyan)] instrument-scan" /></div>
+        </div>
+      )}
+      <p role="status" className="text-[10px] text-muted-foreground">{cameraMessage[cameraState]}</p>
+      {message && <p role="alert" className="mt-2 rounded border border-amber/25 bg-amber/5 px-3 py-2 text-[10px] text-amber">{message}</p>}
+      <div className="mt-4 border-t border-line pt-3 text-left">
+        <label htmlFor="qr-manual" className="mb-1.5 block font-mono text-[9px] uppercase text-muted-foreground">Paste seal payload or product ID</label>
+        <form onSubmit={(event) => { event.preventDefault(); submitManual(manual); }} className="flex gap-2">
+          <Input id="qr-manual" value={manual} onChange={(event) => setManual(event.target.value)} placeholder="verichain:v1:VC-NIKE-001?h=…" className="h-9 border-line bg-background font-mono text-[10px]" />
+          <Button type="submit" className="h-9 shrink-0 px-3 text-xs"><Fingerprint size={14} /> Verify</Button>
+        </form>
+        <p className="mt-2 text-[9px] leading-relaxed text-muted-foreground">
+          Scanning only starts the standard verification — it never proves authenticity.
+        </p>
+      </div>
+    </div>
+  </Modal>;
 }

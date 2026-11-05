@@ -126,11 +126,37 @@ def generate_metadata_hash(product: Product) -> str:
     h = hashlib.sha256(canonical_string.encode('utf-8')).hexdigest()
     return "0x" + h
 
+def verify_chain_id() -> tuple:
+    """
+    Confirm that the connected node is on the expected chain.
+
+    Returns ``(ok, chain_id, message)``. A chain id that cannot be read, or
+    that differs from ``settings.EXPECTED_CHAIN_ID``, is reported as a
+    mismatch so an arbitrary RPC endpoint can never be silently trusted.
+    """
+    expected = settings.EXPECTED_CHAIN_ID
+    try:
+        chain_id = int(w3.eth.chain_id)
+    except Exception as exc:  # noqa: BLE001 - reported to the caller as a status
+        return False, None, f"Could not read chain id from the RPC endpoint: {exc}"
+    if chain_id != expected:
+        return (
+            False,
+            chain_id,
+            f"Chain mismatch: node reports chain id {chain_id}, expected {expected}.",
+        )
+    return True, chain_id, ""
+
+
 def check_blockchain_verification(db: Session, product: Product) -> dict:
     """Check the product against the blockchain registry."""
     if not w3.is_connected():
         return {"status": "BLOCKCHAIN_ERROR", "message": "Could not connect to blockchain node."}
-    
+
+    chain_ok, _chain_id, chain_message = verify_chain_id()
+    if not chain_ok:
+        return {"status": "BLOCKCHAIN_ERROR", "message": chain_message}
+
     contract = w3.eth.contract(address=w3.to_checksum_address(CONTRACT_ADDRESS), abi=REGISTRY_ABI)
     
     try:

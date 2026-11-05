@@ -136,6 +136,7 @@ class TestCheckBlockchainVerification:
 
         with patch("app.services.blockchain_service.w3") as mock_w3:
             mock_w3.is_connected.return_value = True
+            mock_w3.eth.chain_id = 31337
             mock_contract = MagicMock()
             mock_contract.functions.getProduct.return_value.call.side_effect = Exception("execution reverted: Product does not exist")
             mock_w3.eth.contract.return_value = mock_contract
@@ -158,6 +159,7 @@ class TestCheckBlockchainVerification:
 
         with patch("app.services.blockchain_service.w3") as mock_w3:
             mock_w3.is_connected.return_value = True
+            mock_w3.eth.chain_id = 31337
             mock_contract = MagicMock()
             mock_contract.functions.getProduct.return_value.call.return_value = mock_record
             mock_w3.eth.contract.return_value = mock_contract
@@ -181,6 +183,7 @@ class TestCheckBlockchainVerification:
 
         with patch("app.services.blockchain_service.w3") as mock_w3:
             mock_w3.is_connected.return_value = True
+            mock_w3.eth.chain_id = 31337
             mock_contract = MagicMock()
             mock_contract.functions.getProduct.return_value.call.return_value = mock_record
             mock_w3.eth.contract.return_value = mock_contract
@@ -200,6 +203,7 @@ class TestCheckBlockchainVerification:
 
         with patch("app.services.blockchain_service.w3") as mock_w3:
             mock_w3.is_connected.return_value = True
+            mock_w3.eth.chain_id = 31337
             mock_contract = MagicMock()
             mock_contract.functions.getProduct.return_value.call.return_value = mock_record
             mock_w3.eth.contract.return_value = mock_contract
@@ -208,6 +212,33 @@ class TestCheckBlockchainVerification:
             result = check_blockchain_verification(db, p)
 
         assert result["status"] == "INACTIVE"
+
+    def test_returns_blockchain_error_on_chain_id_mismatch(self):
+        """A node on an unexpected chain must never be trusted (G3.6 A)."""
+        p = make_product("VC-NIKE-001", "MFG-NIKE-US", "B2026-091", "NK-A26-0091842", "2026-09-05T00:00:00+00:00")
+        db = MagicMock()
+
+        with patch("app.services.blockchain_service.w3") as mock_w3:
+            mock_w3.is_connected.return_value = True
+            mock_w3.eth.chain_id = 1  # mainnet, not the expected 31337
+            result = check_blockchain_verification(db, p)
+
+        assert result["status"] == "BLOCKCHAIN_ERROR"
+        assert "chain" in result["message"].lower()
+        assert "1" in result["message"]
+
+    def test_returns_blockchain_error_when_chain_id_unreadable(self):
+        """If the chain id cannot be read, the node is not trusted either."""
+        p = make_product("VC-NIKE-001", "MFG-NIKE-US", "B2026-091", "NK-A26-0091842", "2026-09-05T00:00:00+00:00")
+        db = MagicMock()
+
+        with patch("app.services.blockchain_service.w3") as mock_w3:
+            mock_w3.is_connected.return_value = True
+            mock_w3.eth.chain_id = "not-a-chain-id"
+            result = check_blockchain_verification(db, p)
+
+        assert result["status"] == "BLOCKCHAIN_ERROR"
+        assert "chain" in result["message"].lower()
 
 
 class TestVerificationDecisionRules:
@@ -283,3 +314,58 @@ class TestVerificationDecisionRules:
             assert data["outcome"] == "CLONE SUSPECTED"
             assert data["blockchainVerified"] is True
             assert data["cloneDetected"] is True
+
+
+class TestBlockchainStatusEndpoint:
+    """G3.6 A - the status endpoint must report only real, observed values."""
+
+    def test_reports_configured_chain_when_connected(self, client):
+        with patch("app.api.blockchain.w3") as mock_w3:
+            mock_w3.is_connected.return_value = True
+            mock_w3.eth.chain_id = 31337
+            mock_w3.eth.block_number = 42
+            mock_w3.eth.get_code.return_value = b"\x60\x00"
+            mock_w3.to_checksum_address.return_value = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+
+            resp = client.get("/api/blockchain/status")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["connected"] is True
+        assert data["chainId"] == 31337
+        assert data["expectedChainId"] == 31337
+        assert data["chainIdMatches"] is True
+        assert data["networkName"] == "Hardhat Local"
+        assert data["contractDeployed"] is True
+        assert data["blockNumber"] == 42
+        assert data["contractAddress"].startswith("0x")
+
+    def test_reports_unavailable_when_node_down(self, client):
+        with patch("app.api.blockchain.w3") as mock_w3:
+            mock_w3.is_connected.return_value = False
+
+            resp = client.get("/api/blockchain/status")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["connected"] is False
+        assert data["chainId"] is None
+        assert data["blockNumber"] is None
+        assert data["chainIdMatches"] is False
+        assert data["networkName"] == "Unavailable"
+        assert data["contractDeployed"] is False
+
+    def test_reports_unexpected_network_on_chain_mismatch(self, client):
+        with patch("app.api.blockchain.w3") as mock_w3:
+            mock_w3.is_connected.return_value = True
+            mock_w3.eth.chain_id = 1
+            mock_w3.eth.block_number = 7
+            mock_w3.eth.get_code.return_value = b"\x60"
+            mock_w3.to_checksum_address.return_value = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+
+            resp = client.get("/api/blockchain/status")
+
+        data = resp.json()
+        assert data["chainId"] == 1
+        assert data["chainIdMatches"] is False
+        assert data["networkName"] == "Unexpected network"

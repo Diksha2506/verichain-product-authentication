@@ -3,6 +3,7 @@ from datetime import datetime
 
 class BlockchainTransactionResponse(BaseModel):
     id: int
+    product_id: str
     transaction_hash: str
     block_number: int | None
     transaction_type: str

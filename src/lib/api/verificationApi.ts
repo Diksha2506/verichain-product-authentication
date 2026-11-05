@@ -11,12 +11,21 @@ import { z } from "zod";
 import { products, verificationHistory } from "@/lib/mockData";
 import { assessRisk } from "@/lib/riskEngine";
 import { API_CONFIG, API_BASE, API_ENDPOINTS } from "./config";
+import { mapBackendProduct, type BackendProduct } from "./productApi";
 import type { ApiResult } from "@/types/api";
+import type { RiskFactors, RiskLevel } from "@/types/risk";
 import type {
   VerificationRequest,
   VerificationResponse,
   VerificationHistoryEntry,
 } from "@/types/verification";
+
+/** Shape returned by `GET /api/products/{id}/verification-history`. */
+interface BackendVerificationScan {
+  timestamp: string;
+  scan_location?: string | null;
+  result: string;
+}
 
 // ─── Validation ───────────────────────────────────────────────────────────────
 
@@ -62,7 +71,7 @@ export async function verifyProduct(
 ): Promise<ApiResult<VerificationResponse>> {
   const parsed = VerificationRequestSchema.safeParse(request);
   if (!parsed.success) {
-    return { ok: false, error: parsed.error.errors[0].message };
+    return { ok: false, error: parsed.error.errors[0]?.message ?? "Invalid verification request." };
   }
 
   const { productId } = parsed.data;
@@ -112,42 +121,77 @@ export async function verifyProduct(
       method: "POST",
     });
     if (resp.status === 404) return { ok: false, error: "Product not found", code: 404 };
-    if (!resp.ok) return { ok: false, error: `Server error ${resp.status}`, code: resp.status };
-    
+    if (!resp.ok) {
+      return {
+        ok: false,
+        error: `Backend request failed (HTTP ${resp.status}).`,
+        code: resp.status,
+      };
+    }
+
     const data = await resp.json();
+
+    // ─── Canonical QR hash alignment ────────────────────────────────────────
+    // The backend recomputes the canonical metadata hash for the verified
+    // product and returns it in blockchainEvidence.expectedHash. It is the QR
+    // hash source only when it is complete (exactly 64 hex characters) and
+    // belongs to the product announced by this verification response. When it
+    // is absent or invalid, the mapped product's metadataHash becomes "" — QR
+    // generation then refuses to fabricate a seal, and the hint comparison
+    // reports "unknown" — instead of silently presenting the potentially
+    // noncanonical stored database hash as canonical.
+    const backendProduct = data.product as BackendProduct | null | undefined;
+    const rawExpectedHash = data.blockchainEvidence?.expectedHash;
+    const expectedHex =
+      typeof rawExpectedHash === "string"
+        ? rawExpectedHash.replace(/^0[xX]/, "") // strip one optional prefix
+        : "";
+    const sameProduct =
+      backendProduct != null &&
+      typeof backendProduct.product_id === "string" &&
+      typeof data.productId === "string" &&
+      backendProduct.product_id.toUpperCase() === data.productId.toUpperCase();
+    const canonicalExpectedHex =
+      sameProduct && /^[0-9a-f]{64}$/.test(expectedHex) ? expectedHex : "";
+
+    // The verified product's metadata hash is the canonical hash, or "" when
+    // no canonical hash is available. The verification boundary never falls
+    // back to the stored column — a possibly noncanonical database value must
+    // not masquerade as the canonical identity on a live verification result.
+    const verifiedProduct = mapBackendProduct(
+      backendProduct as BackendProduct,
+      data.blockchainEvidence?.latestTxHash ?? ""
+    );
+    verifiedProduct.metadataHash = canonicalExpectedHex;
+
+    // The backend returns snake_case risk columns; derive the frontend
+    // RiskAssessment shape from them instead of inventing a second scoring path.
+    const backendRisk = data.riskAssessment;
+    const backendFactors: RiskFactors = backendRisk
+      ? {
+          location: backendRisk.location_anomaly,
+          duplicateScans: backendRisk.duplicate_scan_risk,
+          travel: backendRisk.travel_anomaly,
+          supplyChain: backendRisk.supply_chain_mismatch,
+          frequency: backendRisk.scan_frequency,
+        }
+      : { location: 0, duplicateScans: 0, travel: 0, supplyChain: 0, frequency: 0 };
+    const riskAssessment = backendRisk
+      ? {
+          ...assessRisk(backendFactors),
+          totalScore: backendRisk.total_score,
+          level: backendRisk.risk_level as RiskLevel,
+        }
+      : assessRisk(backendFactors);
+
     return {
       ok: true,
       data: {
         requestId: data.requestId,
         productId: data.productId,
         outcome: data.outcome as VerificationResponse["outcome"],
-        product: {
-          id: data.product.product_id,
-          name: data.product.name,
-          manufacturer: data.product.manufacturer_id?.toString() ?? "Unknown",
-          batchId: data.product.batch_id ?? "",
-          serialNumber: data.product.serial_number ?? "",
-          metadataHash: data.product.metadata_hash ?? "",
-          status: data.product.status,
-          manufacturedAt: data.product.manufactured_at ?? "Unknown",
-          manufacturedDisplay: data.product.manufactured_at
-            ? new Date(data.product.manufactured_at).toLocaleDateString()
-            : "Unknown",
-          riskFactors: { location: 0, duplicateScans: 0, travel: 0, supplyChain: 0, frequency: 0 },
-          recentScans: [],
-        },
-        riskAssessment: {
-          totalScore: data.riskAssessment.total_score,
-          riskLevel: data.riskAssessment.risk_level,
-          factors: {
-            location: data.riskAssessment.location_anomaly,
-            duplicateScans: data.riskAssessment.duplicate_scan_risk,
-            travel: data.riskAssessment.travel_anomaly,
-            supplyChain: data.riskAssessment.supply_chain_mismatch,
-            frequency: data.riskAssessment.scan_frequency,
-          },
-          reasons: data.reasons,
-        },
+        product: verifiedProduct,
+        riskAssessment,
         verificationLevel: data.verificationLevel as 1 | 2 | 3,
         blockchainVerified: data.blockchainVerified,
         provenanceVerified: data.provenanceVerified,
@@ -155,39 +199,50 @@ export async function verifyProduct(
         verifiedAt: data.verifiedAt,
         verifiedAtIso: data.verifiedAtIso,
         decisionReason: data.decisionReason,
-        blockchainEvidence: data.blockchainEvidence
+        ...(data.blockchainEvidence
           ? {
-              status: data.blockchainEvidence.status,
-              message: data.blockchainEvidence.message,
-              verified: data.blockchainEvidence.verified,
-              onChainActive: data.blockchainEvidence.on_chain_active,
-              expectedHash: data.blockchainEvidence.expected_hash,
-              contractAddress: data.blockchainEvidence.contract_address,
-              latestTxHash: data.blockchainEvidence.latest_tx_hash,
+              blockchainEvidence: {
+                status: data.blockchainEvidence.status,
+                message: data.blockchainEvidence.message,
+                verified: data.blockchainEvidence.verified,
+                onChainActive: data.blockchainEvidence.onChainActive,
+                expectedHash: data.blockchainEvidence.expectedHash,
+                contractAddress: data.blockchainEvidence.contractAddress,
+                latestTxHash: data.blockchainEvidence.latestTxHash,
+              },
             }
-          : undefined,
-        provenanceEvidence: data.provenanceEvidence
+          : {}),
+        ...(data.provenanceEvidence
           ? {
-              eventCount: data.provenanceEvidence.event_count,
-              trailIntact: data.provenanceEvidence.trail_intact,
-              lastEvent: data.provenanceEvidence.last_event,
-              lastLocation: data.provenanceEvidence.last_location,
-              lastTimestamp: data.provenanceEvidence.last_timestamp,
+              provenanceEvidence: {
+                eventCount: data.provenanceEvidence.eventCount,
+                trailIntact: data.provenanceEvidence.trailIntact,
+                lastEvent: data.provenanceEvidence.lastEvent,
+                lastLocation: data.provenanceEvidence.lastLocation,
+                lastTimestamp: data.provenanceEvidence.lastTimestamp,
+              },
             }
-          : undefined,
-        riskEvidence: data.riskEvidence
+          : {}),
+        ...(data.riskEvidence
           ? {
-              totalScore: data.riskEvidence.total_score,
-              riskLevel: data.riskEvidence.risk_level,
-              verificationLevel: data.riskEvidence.verification_level,
-              reasons: data.riskEvidence.reasons,
-              anomalies: data.riskEvidence.anomalies,
+              riskEvidence: {
+                totalScore: data.riskEvidence.totalScore,
+                riskLevel: data.riskEvidence.riskLevel,
+                verificationLevel: data.riskEvidence.verificationLevel,
+                reasons: data.riskEvidence.reasons,
+                anomalies: data.riskEvidence.anomalies,
+              },
             }
-          : undefined,
+          : {}),
       }
     };
-  } catch (err) {
-    return { ok: false, error: "Backend unavailable" };
+  } catch {
+    return {
+      ok: false,
+      error:
+        "Backend unavailable. Start the VeriChain API or enable mock mode (VITE_USE_MOCK).",
+      code: 503,
+    };
   }
 }
 
@@ -209,23 +264,34 @@ export async function getVerificationHistory(
 
   // Real backend
   if (!productId) return { ok: true, data: [] }; // Global history not supported yet in backend
-  
+
   try {
     const resp = await fetch(`${API_BASE}${API_ENDPOINTS.products.history(productId)}`);
-    if (!resp.ok) return { ok: false, error: `Server error ${resp.status}`, code: resp.status };
-    
-    const scans = await resp.json();
+    if (!resp.ok) {
+      return {
+        ok: false,
+        error: `Backend request failed (HTTP ${resp.status}).`,
+        code: resp.status,
+      };
+    }
+
+    const scans = (await resp.json()) as BackendVerificationScan[];
     return {
       ok: true,
-      data: scans.map((scan: any) => ({
+      data: scans.map((scan) => ({
         productId: productId.toUpperCase(),
         timeAgo: new Date(scan.timestamp).toLocaleDateString(),
         place: scan.scan_location ?? "Unknown Location",
-        outcome: scan.result,
+        outcome: scan.result as VerificationResponse["outcome"],
         timestamp: scan.timestamp,
       })),
     };
-  } catch (err) {
-    return { ok: false, error: "Backend unavailable" };
+  } catch {
+    return {
+      ok: false,
+      error:
+        "Backend unavailable. Start the VeriChain API or enable mock mode (VITE_USE_MOCK).",
+      code: 503,
+    };
   }
 }

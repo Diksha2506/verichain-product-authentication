@@ -5,6 +5,7 @@ import json
 from web3 import Web3
 
 from ..core.database import get_db
+from ..core.config import settings
 from ..models.product import Product
 from ..models.blockchain import BlockchainTransaction
 from ..schemas.blockchain import BlockchainTransactionResponse, BlockchainRegistrationResponse
@@ -12,6 +13,67 @@ from ..services.product_service import get_product_by_product_id
 from ..services.blockchain_service import w3, CONTRACT_ADDRESS, REGISTRY_ABI, generate_metadata_hash
 
 router = APIRouter(prefix="/api/products", tags=["blockchain"])
+network_router = APIRouter(prefix="/api/blockchain", tags=["blockchain"])
+
+
+@network_router.get("/status")
+def get_blockchain_status():
+    """
+    Read-only description of the configured chain.
+
+    Every field is derived from the live node or from backend settings — no
+    value is fabricated. When the node is unreachable, ``connected`` is false
+    and the chain-specific fields are null so the UI can show "unavailable"
+    instead of inventing data.
+    """
+    connected = w3.is_connected()
+    chain_id = None
+    block_number = None
+    contract_deployed = False
+
+    if connected:
+        try:
+            chain_id = int(w3.eth.chain_id)
+            block_number = int(w3.eth.block_number)
+            code = w3.eth.get_code(w3.to_checksum_address(CONTRACT_ADDRESS))
+            contract_deployed = bool(code) and code != b"\x00"
+        except Exception:  # noqa: BLE001 - a broken RPC is reported as disconnected
+            connected = False
+
+    expected = settings.EXPECTED_CHAIN_ID
+    chain_matches = bool(connected and chain_id == expected)
+    if not connected:
+        network_name = "Unavailable"
+    elif chain_matches:
+        network_name = "Hardhat Local"
+    else:
+        network_name = "Unexpected network"
+
+    return {
+        "connected": connected,
+        "chainId": chain_id,
+        "expectedChainId": expected,
+        "chainIdMatches": chain_matches,
+        "networkName": network_name,
+        "contractAddress": CONTRACT_ADDRESS,
+        "contractDeployed": contract_deployed,
+        "blockNumber": block_number,
+    }
+
+
+@network_router.get("/transactions", response_model=list[BlockchainTransactionResponse])
+def list_blockchain_transactions(db: Session = Depends(get_db)):
+    """
+    Read-only ledger of transactions actually recorded by this backend.
+
+    Nothing here is synthesised: if the database has no rows, the response is
+    an empty list and the UI says so rather than showing demo transactions.
+    """
+    return (
+        db.query(BlockchainTransaction)
+        .order_by(BlockchainTransaction.timestamp.desc())
+        .all()
+    )
 
 @router.get("/{product_id}/blockchain", response_model=list[BlockchainTransactionResponse])
 def get_blockchain_history(product_id: str, db: Session = Depends(get_db)):

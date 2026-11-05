@@ -116,7 +116,6 @@ export const products: Product[] = [
     id: "VC-FAKE-999",
     name: "Air Max 2026 · unverified unit",
     manufacturer: "Unknown",
-    manufacturerId: undefined,
     batchId: "UNREGISTERED",
     serialNumber: "XX-000-9999",
     metadataHash: "0000000000000000000000000000000000000000000000000000000000000000",
